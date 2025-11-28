@@ -24,27 +24,19 @@ struct Backend {
 }
 
 impl Backend {
-    async fn on_change(&self, uri: Url, text: &str) {
+    fn on_change(&self, uri: Url, text: &str) {
         let rope = ropey::Rope::from_str(text);
-        self.document_map.insert(uri.to_string(), rope.clone());
-
-        // Resolve and cache schema association
-        let roots = self.workspace_roots.read().await;
-        let schema_source =
-            self.schema_manager
-                .resolve_schema_for_document(&uri.to_string(), text, &roots);
-        self.schema_manager
-            .update_document_schema(&uri.to_string(), schema_source);
+        self.document_map.insert(uri.to_string(), rope);
     }
 
     /// Validate document against its associated schema.
-    fn validate_with_schema(&self, uri: &str, doc: &KdlDocument, rope: &Rope) -> Vec<Diagnostic> {
+    fn validate_with_schema(
+        &self,
+        doc: &KdlDocument,
+        rope: &Rope,
+        schema_source: &SchemaSource,
+    ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
-
-        let schema_source = match self.schema_manager.document_schemas.get(uri) {
-            Some(source) => source.clone(),
-            None => return diagnostics,
-        };
 
         match &schema_source {
             SchemaSource::Directive {
@@ -234,18 +226,16 @@ impl LanguageServer for Backend {
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
-        self.on_change(params.text_document.uri, &params.text_document.text)
-            .await;
+        self.on_change(params.text_document.uri, &params.text_document.text);
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        self.on_change(params.text_document.uri, &params.content_changes[0].text)
-            .await;
+        self.on_change(params.text_document.uri, &params.content_changes[0].text);
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
         if let Some(text) = params.text.as_ref() {
-            self.on_change(params.text_document.uri, text).await;
+            self.on_change(params.text_document.uri, text);
         }
     }
 
@@ -304,14 +294,27 @@ impl LanguageServer for Backend {
         tracing::debug!("diagnostic req");
         let uri = params.text_document.uri.to_string();
 
-        if let Some(doc) = self.document_map.get(&uri) {
-            let text = doc.to_string();
+        if let Some(rope) = self.document_map.get(&uri) {
+            let text = rope.to_string();
             let res: std::result::Result<KdlDocument, KdlError> = text.parse();
 
             match res {
                 Ok(parsed_doc) => {
-                    // Document parsed successfully - run schema validation
-                    let schema_diags = self.validate_with_schema(&uri, &parsed_doc, &doc);
+                    // Resolve schema from the already-parsed document (no double-parsing!)
+                    let roots = self.workspace_roots.read().await;
+                    let schema_source = self.schema_manager.resolve_schema_for_parsed_document(
+                        &uri,
+                        &parsed_doc,
+                        &roots,
+                    );
+
+                    // Update cached association
+                    self.schema_manager
+                        .update_document_schema(&uri, schema_source.clone());
+
+                    // Run schema validation
+                    let schema_diags =
+                        self.validate_with_schema(&parsed_doc, &rope, &schema_source);
 
                     return Ok(DocumentDiagnosticReportResult::Report(
                         DocumentDiagnosticReport::Full(RelatedFullDocumentDiagnosticReport {
@@ -331,8 +334,8 @@ impl LanguageServer for Backend {
                         .map(|diag| {
                             Diagnostic::new(
                                 Range::new(
-                                    char_to_position(diag.span.offset(), &doc),
-                                    char_to_position(diag.span.offset() + diag.span.len(), &doc),
+                                    char_to_position(diag.span.offset(), &rope),
+                                    char_to_position(diag.span.offset() + diag.span.len(), &rope),
                                 ),
                                 diag.severity().map(to_lsp_sev),
                                 diag.code().map(|c| NumberOrString::String(c.to_string())),

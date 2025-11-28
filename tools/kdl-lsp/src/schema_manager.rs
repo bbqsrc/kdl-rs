@@ -71,16 +71,18 @@ impl SchemaManager {
         Self::default()
     }
 
-    /// Resolve which schema applies to a document.
-    pub fn resolve_schema_for_document(
+    /// Resolve which schema applies to a document (from already-parsed KdlDocument).
+    ///
+    /// This is the preferred method as it avoids double-parsing.
+    pub fn resolve_schema_for_parsed_document(
         &self,
         document_uri: &str,
-        document_text: &str,
+        parsed_doc: &KdlDocument,
         workspace_roots: &[PathBuf],
     ) -> SchemaSource {
         // 1. First, check for @ksl:schema directive in the document
         if let Some(directive_source) =
-            self.extract_directive_schema(document_uri, document_text, workspace_roots)
+            self.extract_directive_from_parsed(document_uri, parsed_doc, workspace_roots)
         {
             return directive_source;
         }
@@ -93,15 +95,13 @@ impl SchemaManager {
         SchemaSource::None
     }
 
-    /// Extract @ksl:schema directive from document.
-    fn extract_directive_schema(
+    /// Extract @ksl:schema directive from an already-parsed document.
+    fn extract_directive_from_parsed(
         &self,
         uri: &str,
-        text: &str,
+        doc: &KdlDocument,
         workspace_roots: &[PathBuf],
     ) -> Option<SchemaSource> {
-        // Parse document to find @ksl:schema node
-        let doc: KdlDocument = text.parse().ok()?;
         let directive = doc.get("@ksl:schema")?;
         let schema_path_str = directive.get(0)?.as_string()?;
 
