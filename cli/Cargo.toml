@@ -1,0 +1,13 @@
+[package]
+name = "kdl-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "kdl"
+path = "src/main.rs"
+
+[dependencies]
+kdl = { path = "..", features = ["span", "v1-fallback", "schema-v2"] }
+clap = { version = "4", features = ["derive"] }
+miette = { workspace = true, features = ["fancy"] }
