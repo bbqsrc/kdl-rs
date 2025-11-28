@@ -13,10 +13,13 @@ rust-version = "1.81"
 
 [dependencies]
 miette.workspace = true
-kdl = { version = "6.5.0", path = "../../", features = ["span", "v1-fallback"] }
+kdl = { version = "6.5.0", path = "../../", features = ["span", "v1-fallback", "schema-v2"] }
 tower-lsp = "0.20.0"
 dashmap = "6.1.0"
 ropey = "1.6.1"
 tokio = { version = "1.43.0", features = ["full"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+globset = "0.4"
+url = "2.5"
+serde_json = "1.0"
