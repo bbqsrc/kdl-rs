@@ -1,593 +1,590 @@
-use crate::nom_compat::many0;
-use crate::query::{
+//! KQL (KDL Query Language) parser using winnow.
+//!
+//! This module provides a KQL parser that uses the winnow parser combinator
+//! library, matching the v2_parser.rs patterns.
+
+use std::sync::Arc;
+
+use miette::Severity;
+use winnow::{
+    combinator::{alt, cut_err, delimited, opt, peek, preceded, repeat, separated, terminated},
+    error::{AddContext, ErrMode, ErrorKind, ParserError},
+    prelude::*,
+    stream::{Location, Stream},
+    token::{one_of, take_while},
+    LocatingSlice,
+};
+
+use crate::{KdlDiagnostic, KdlValue};
+
+// Re-use the query types from the main query module
+pub(crate) use crate::query::{
     KdlQuery, KdlQueryAttributeOp, KdlQueryMatcher, KdlQueryMatcherAccessor,
     KdlQueryMatcherDetails, KdlQuerySelector, KdlQuerySelectorSegment, KdlSegmentCombinator,
 };
-use crate::v1_parser::{value, KdlParser};
-use crate::{KdlDiagnostic, KdlErrorKind, KdlParseError, KdlValue};
-use miette::Severity;
-use nom::branch::alt;
-use nom::bytes::complete::tag;
-use nom::combinator::{all_consuming, cut, map, opt, recognize};
-use nom::error::context;
-use nom::multi::separated_list1;
-use nom::sequence::{delimited, preceded, terminated};
-use nom::{Finish, IResult, Offset, Parser};
 
-pub(crate) struct KdlQueryParser<'a>(KdlParser<'a>);
+type Input<'a> = LocatingSlice<&'a str>;
+type PResult<T> = winnow::PResult<T, QueryParseError>;
 
-impl<'a> KdlQueryParser<'a> {
-    pub(crate) fn new(full_input: &'a str) -> Self {
-        Self(KdlParser::new(full_input))
+/// Error type for query parsing.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct QueryParseError {
+    pub(crate) message: Option<String>,
+    pub(crate) label: Option<String>,
+    pub(crate) help: Option<String>,
+    pub(crate) offset: usize,
+    pub(crate) len: usize,
+}
+
+impl<I: Stream> ParserError<I> for QueryParseError {
+    fn from_error_kind(_input: &I, _kind: ErrorKind) -> Self {
+        Self::default()
     }
 
-    pub(crate) fn parse<T, P>(&self, parser: P) -> Result<T, KdlDiagnostic>
-    where
-        P: Parser<&'a str, T, KdlParseError<&'a str>>,
-    {
-        all_consuming(parser)(self.0.full_input)
-            .finish()
-            .map(|(_, arg)| arg)
-            .map_err(|e| {
-                let span_substr = &e.input[..e.len];
-                KdlDiagnostic {
-                    input: self.0.full_input.into(),
-                    span: self.0.span_from_substr(span_substr),
-                    help: if let Some(help) = e.help {
-                        Some(help)
-                    } else if e.kind.is_none() && e.context.is_none() {
-                        Some("The general syntax for queries is '(type)nodename[prop=value], anothernode, etc'. For more details, please see https://github.com/kdl-org/kdl/blob/main/QUERY-SPEC.md")
-                    } else {
-                        None
-                    },
-                    label: e.label,
-                    kind: if let Some(kind) = e.kind {
-                        kind
-                    } else if let Some(ctx) = e.context {
-                        KdlErrorKind::Context(ctx)
-                    } else {
-                        KdlErrorKind::Context("a valid KQL query")
-                    },
+    fn append(
+        self,
+        _input: &I,
+        _token_start: &<I as Stream>::Checkpoint,
+        _kind: ErrorKind,
+    ) -> Self {
+        self
+    }
+}
+
+impl<I: Stream + Location> AddContext<I, &'static str> for QueryParseError {
+    fn add_context(
+        mut self,
+        input: &I,
+        _token_start: &<I as Stream>::Checkpoint,
+        ctx: &'static str,
+    ) -> Self {
+        if self.label.is_none() {
+            self.label = Some(ctx.to_string());
+        }
+        self.offset = input.location();
+        self
+    }
+}
+
+/// Parse a KQL query string.
+pub(crate) fn parse_query(input: &str) -> Result<KdlQuery, KdlDiagnostic> {
+    let mut input = LocatingSlice::new(input);
+    match query.parse_next(&mut input) {
+        Ok(q) => {
+            // Check for trailing content
+            wss.parse_next(&mut input).ok();
+            if !input.is_empty() {
+                return Err(KdlDiagnostic {
+                    input: Arc::new(input.to_string()),
+                    span: (input.location()..input.location() + 1).into(),
+                    message: Some("Unexpected content after query".into()),
+                    label: Some("unexpected".into()),
+                    help: Some("Remove trailing content or check query syntax".into()),
                     severity: Severity::Error,
-                }
+                });
+            }
+            Ok(q)
+        }
+        Err(e) => {
+            let err = match e {
+                ErrMode::Backtrack(e) | ErrMode::Cut(e) => e,
+                ErrMode::Incomplete(_) => QueryParseError::default(),
+            };
+            Err(KdlDiagnostic {
+                input: Arc::new(input.to_string()),
+                span: (err.offset..err.offset + err.len.max(1)).into(),
+                message: err.message,
+                label: err.label,
+                help: err.help.or(Some(
+                    "The syntax for queries is '(type)nodename[prop=value], another'. See QUERY-SPEC.md"
+                        .into(),
+                )),
+                severity: Severity::Error,
             })
-    }
-}
-
-fn set_details<'a>(
-    mut err: nom::Err<KdlParseError<&'a str>>,
-    start: &'a str,
-    label: Option<&'static str>,
-    help: Option<&'static str>,
-) -> nom::Err<KdlParseError<&'a str>> {
-    match &mut err {
-        nom::Err::Error(e) | nom::Err::Failure(e) => {
-            if !e.touched {
-                e.len = start.offset(e.input);
-                e.input = start;
-                e.label = label;
-                e.help = help;
-                e.touched = true;
-            }
         }
-        _ => {}
     }
-    err
 }
 
-pub(crate) fn query<'a: 'b, 'b>(
-    kdl_parser: &'b KdlQueryParser<'a>,
-) -> impl FnMut(&'a str) -> IResult<&'a str, KdlQuery, KdlParseError<&'a str>> + 'b {
-    map(
-        separated_list1(
-            delimited(whitespace, tag(","), whitespace),
-            query_selector(kdl_parser),
-        ),
-        KdlQuery,
-    )
+/// `query := selector (',' selector)*`
+fn query(input: &mut Input<'_>) -> PResult<KdlQuery> {
+    separated(1.., query_selector, (wss, ",", wss))
+        .map(KdlQuery)
+        .parse_next(input)
 }
 
-fn query_selector<'a: 'b, 'b>(
-    kdl_parser: &'b KdlQueryParser<'a>,
-) -> impl Fn(&'a str) -> IResult<&'a str, KdlQuerySelector, KdlParseError<&'a str>> + 'b {
-    move |input| {
-        let mut segments = Vec::new();
-        let mut is_scope = true;
-        let mut input = input;
-        loop {
-            let (inp, _) = whitespace(input)?;
-            input = inp;
-            let (inp, matchers) = node_matchers(kdl_parser, is_scope)(input)?;
-            input = inp;
-            let (inp, _) = whitespace(input)?;
-            input = inp;
-            let (inp, op) = opt(segment_combinator)(input)?;
-            input = inp;
-            let is_last = op.is_none();
-            segments.push(KdlQuerySelectorSegment {
-                op,
-                matcher: KdlQueryMatcher(matchers),
-            });
-            if is_last {
-                break;
-            }
-            is_scope = false;
+/// Parse a single selector.
+fn query_selector(input: &mut Input<'_>) -> PResult<KdlQuerySelector> {
+    let mut segments = Vec::new();
+    let mut is_scope = true;
+
+    loop {
+        wss.parse_next(input)?;
+        let matchers = node_matchers(is_scope).parse_next(input)?;
+        wss.parse_next(input)?;
+        let op = opt(segment_combinator).parse_next(input)?;
+
+        let is_last = op.is_none();
+        segments.push(KdlQuerySelectorSegment {
+            op,
+            matcher: KdlQueryMatcher(matchers),
+        });
+
+        if is_last {
+            break;
         }
-        let (input, _) = whitespace(input)?;
-        Ok((input, KdlQuerySelector(segments)))
+        is_scope = false;
     }
+
+    wss.parse_next(input)?;
+    Ok(KdlQuerySelector(segments))
 }
 
-fn segment_combinator(input: &str) -> IResult<&str, KdlSegmentCombinator, KdlParseError<&str>> {
+/// Parse segment combinator: `>`, `>>`, `+`, `++`
+fn segment_combinator(input: &mut Input<'_>) -> PResult<KdlSegmentCombinator> {
     alt((
-        map(tag(">>"), |_| KdlSegmentCombinator::Descendant),
-        map(tag(">"), |_| KdlSegmentCombinator::Child),
-        map(tag("++"), |_| KdlSegmentCombinator::Sibling),
-        map(tag("+"), |_| KdlSegmentCombinator::Neighbor),
-    ))(input)
+        ">>".map(|_| KdlSegmentCombinator::Descendant),
+        ">".map(|_| KdlSegmentCombinator::Child),
+        "++".map(|_| KdlSegmentCombinator::Sibling),
+        "+".map(|_| KdlSegmentCombinator::Neighbor),
+    ))
+    .parse_next(input)
 }
 
-fn node_matchers<'a: 'b, 'b>(
-    kdl_parser: &'b KdlQueryParser<'a>,
+/// Parse node matchers within a selector segment.
+fn node_matchers(
     is_scope: bool,
-) -> impl Fn(&'a str) -> IResult<&'a str, Vec<KdlQueryMatcherDetails>, KdlParseError<&'a str>> + 'b
-{
-    move |input| {
+) -> impl FnMut(&mut Input<'_>) -> PResult<Vec<KdlQueryMatcherDetails>> {
+    move |input: &mut Input<'_>| {
         let mut matchers = Vec::new();
+        wss.parse_next(input)?;
 
-        let (input, _) = whitespace(input)?;
-
-        let start = input;
-        let (input, scope) = opt(scope_accessor)(input)?;
-        if let Some(xsr) = scope {
+        // Check for scope() accessor
+        let start = input.checkpoint();
+        if let Some(()) = opt(scope_accessor).parse_next(input)? {
             if is_scope {
                 matchers.push(KdlQueryMatcherDetails {
                     op: KdlQueryAttributeOp::Equal,
-                    accessor: xsr,
+                    accessor: KdlQueryMatcherAccessor::Scope,
                     value: None,
                 });
-                return Ok((input, matchers));
+                return Ok(matchers);
             } else {
-                return Err(nom::Err::Error(KdlParseError {
-                    input: start,
-                    len: start.len() - input.len(),
-                    kind: None,
-                    label: Some("scope()"),
-                    help: Some("Make sure scope() precedes any other items within a (comma-separated) selector."),
-                    touched: false,
-                    context: Some("scope() to be the first item in this selector"),
+                input.reset(&start);
+                return Err(ErrMode::Cut(QueryParseError {
+                    message: Some("scope() must be the first item in a selector".into()),
+                    label: Some("scope()".into()),
+                    help: Some("Move scope() to the beginning".into()),
+                    offset: input.location(),
+                    len: 7,
                 }));
             }
         }
 
-        let (input, details) = opt(annotation_matcher(kdl_parser))(input)?;
-        if let Some(details) = details {
+        // Check for type annotation `(type)`
+        if let Some(details) = opt(annotation_matcher).parse_next(input)? {
             matchers.push(details);
-            let start = input;
-            let (input, typed) = opt(annotation_matcher(kdl_parser))(input)?;
-            if typed.is_some() {
-                return Err(nom::Err::Error(KdlParseError {
-                    input: start,
-                    len: start.len() - input.len(),
-                    kind: None,
-                    label: Some("type annotation"),
-                    help: Some("The syntax for node selectors is (type)node[attribute=value]."),
-                    touched: false,
-                    context: Some("only one type annotation per selector"),
+            // Can't have two annotations
+            if opt(annotation_matcher).parse_next(input)?.is_some() {
+                return Err(ErrMode::Cut(QueryParseError {
+                    message: Some("Only one type annotation per selector".into()),
+                    label: Some("type annotation".into()),
+                    help: Some("Syntax: (type)node[attr=value]".into()),
+                    offset: input.location(),
+                    len: 1,
                 }));
             }
         }
 
-        let (input, node) = opt(crate::v1_parser::identifier(&kdl_parser.0))(input)?;
-        if let Some(node) = node {
+        // Check for node name
+        if let Some(ident) = opt(identifier).parse_next(input)? {
             matchers.push(KdlQueryMatcherDetails {
                 op: KdlQueryAttributeOp::Equal,
-                value: Some(KdlValue::String(node.value().to_owned())),
+                value: Some(KdlValue::String(ident)),
                 accessor: KdlQueryMatcherAccessor::Node,
             });
         }
 
-        let start = input;
-        let (input, typed) = opt(annotation_matcher(kdl_parser))(input)?;
-        if typed.is_some() {
-            return Err(nom::Err::Error(KdlParseError {
-                input: start,
-                len: start.len() - input.len(),
-                kind: None,
-                label: Some("type annotation"),
-                help: Some("The syntax for node selectors is (type)node[attribute=value]."),
-                touched: false,
-                context: Some("type annotation to not be used after a node name"),
+        // No type annotation after node name
+        if opt(peek(annotation_matcher)).parse_next(input)?.is_some() {
+            return Err(ErrMode::Cut(QueryParseError {
+                message: Some("Type annotation must come before node name".into()),
+                label: Some("type annotation".into()),
+                help: Some("Syntax: (type)node[attr=value]".into()),
+                offset: input.location(),
+                len: 1,
             }));
         }
 
-        let start = input;
-        let (input, mut attribute_matchers) = many0(attribute_matcher(kdl_parser))(input)?;
-        matchers.append(&mut attribute_matchers);
+        // Parse attribute matchers `[...]`
+        let mut attrs: Vec<KdlQueryMatcherDetails> =
+            repeat(0.., attribute_matcher).parse_next(input)?;
+        matchers.append(&mut attrs);
 
         if matchers.is_empty() {
-            Err(nom::Err::Error(KdlParseError {
-                input: start,
+            return Err(ErrMode::Backtrack(QueryParseError {
+                message: Some("Empty node matcher".into()),
+                label: Some("node matcher".into()),
+                help: Some("Provide at least a node name or attribute matcher".into()),
+                offset: input.location(),
                 len: 0,
-                kind: None,
-                label: Some("node matcher"),
-                help: Some("node matcher must not be empty"),
-                touched: false,
-                context: Some("a valid node matcher"),
-            }))
-        } else {
-            // Check for trailing type annotations.
-            let start = input;
-            let (end, typed) = opt(annotation_matcher(kdl_parser))(input)?;
-            if typed.is_some() {
-                return Err(nom::Err::Error(KdlParseError {
-                    input: start,
-                    len: start.len() - end.len(),
-                    kind: None,
-                    label: Some("type annotation"),
-                    help: Some("The syntax for node selectors is (type)node[attribute=value]."),
-                    touched: false,
-                    context: Some("type annotation to come before attribute matcher(s)"),
-                }));
-            }
-
-            // Check for trailing node name matcher.
-            let (end, ident) = opt(crate::v1_parser::identifier(&kdl_parser.0))(input)?;
-            if ident.is_some() {
-                return Err(nom::Err::Error(KdlParseError {
-                    input: start,
-                    len: start.len() - end.len(),
-                    kind: None,
-                    label: Some("node name"),
-                    help: Some("The syntax for node selectors is (type)node[attribute=value]."),
-                    touched: false,
-                    context: Some("node name to come before attribute matcher(s)"),
-                }));
-            }
-
-            Ok((input, matchers))
-        }
-    }
-}
-
-fn attribute_matcher<'a: 'b, 'b>(
-    kdl_parser: &'b KdlQueryParser<'a>,
-) -> impl Fn(&'a str) -> IResult<&'a str, KdlQueryMatcherDetails, KdlParseError<&'a str>> + 'b {
-    move |input| {
-        let start = input;
-        let (input, _) = tag("[")(input)?;
-        let (input, _) = whitespace(input)?;
-        let (input, matcher) = attribute_matcher_inner(kdl_parser)(input)?;
-        let (input, _) = whitespace(input)?;
-        let (input, _) = context("a closing ']' for this attribute matcher", cut(tag("]")))(input)
-            .map_err(|e| set_details(e, start, Some("partial attribute matcher"), None))?;
-
-        Ok((input, matcher))
-    }
-}
-
-fn attribute_matcher_inner<'a: 'b, 'b>(
-    kdl_parser: &'b KdlQueryParser<'a>,
-) -> impl Fn(&'a str) -> IResult<&'a str, KdlQueryMatcherDetails, KdlParseError<&'a str>> + 'b {
-    move |input| {
-        let (input, xsr) = opt(accessor(kdl_parser))(input)?;
-        if let Some(xsr) = xsr {
-            let (input, _) = whitespace(input)?;
-            let (input, op) = opt(attribute_op)(input)?;
-            let (input, _) = whitespace(input)?;
-            if let Some(op) = op {
-                let prev = input;
-                let (input, val) = opt(crate::v1_parser::value)(input)?;
-                // Make sure it's a syntax error to try and use string
-                // operators with non-string arguments.
-                if let Some((_, value)) = val {
-                    if matches!(
-                        op,
-                        KdlQueryAttributeOp::StartsWith
-                            | KdlQueryAttributeOp::EndsWith
-                            | KdlQueryAttributeOp::Contains
-                    ) {
-                        if value.is_string() {
-                            Ok((
-                                input,
-                                KdlQueryMatcherDetails {
-                                    op,
-                                    value: Some(value),
-                                    accessor: xsr,
-                                },
-                            ))
-                        } else {
-                            Err(nom::Err::Failure(KdlParseError {
-                                input: prev,
-                                len: prev.len() - input.len(),
-                                kind: None,
-                                label: Some("non-string operator value"),
-                                help: Some("Only strings can be used as arguments for string-related operators (*=, ^=, $=)."),
-                                touched: false,
-                                context: Some("a string as an operator value"),
-                            }))
-                        }
-                    } else {
-                        Ok((
-                            input,
-                            KdlQueryMatcherDetails {
-                                op,
-                                value: Some(value),
-                                accessor: xsr,
-                            },
-                        ))
-                    }
-                } else {
-                    Err(nom::Err::Failure(KdlParseError {
-                        input: prev,
-                        len: 0,
-                        kind: None,
-                        label: Some("operator value"),
-                        help: Some("Only valid KDL values can be used on the right hand side of attribute matcher operators."),
-                        touched: false,
-                        context: Some("a valid operator argument"),
-                    }))
-                }
-            } else {
-                Ok((
-                    input,
-                    KdlQueryMatcherDetails {
-                        op: KdlQueryAttributeOp::Equal,
-                        value: None,
-                        accessor: xsr,
-                    },
-                ))
-            }
-        } else {
-            Ok((
-                input,
-                KdlQueryMatcherDetails {
-                    op: KdlQueryAttributeOp::Equal,
-                    value: None,
-                    accessor: KdlQueryMatcherAccessor::Node,
-                },
-            ))
-        }
-    }
-}
-
-fn attribute_op(input: &str) -> IResult<&str, KdlQueryAttributeOp, KdlParseError<&str>> {
-    alt((
-        map(tag("="), |_| KdlQueryAttributeOp::Equal),
-        map(tag("!="), |_| KdlQueryAttributeOp::NotEqual),
-        map(tag(">"), |_| KdlQueryAttributeOp::Gt),
-        map(tag(">="), |_| KdlQueryAttributeOp::Gte),
-        map(tag("<"), |_| KdlQueryAttributeOp::Lt),
-        map(tag("<="), |_| KdlQueryAttributeOp::Lte),
-        map(tag("^="), |_| KdlQueryAttributeOp::StartsWith),
-        map(tag("$="), |_| KdlQueryAttributeOp::EndsWith),
-        map(tag("*="), |_| KdlQueryAttributeOp::Contains),
-    ))(input)
-}
-
-fn annotation_matcher<'a: 'b, 'b>(
-    kdl_parser: &'b KdlQueryParser<'a>,
-) -> impl Fn(&'a str) -> IResult<&'a str, KdlQueryMatcherDetails, KdlParseError<&'a str>> + 'b {
-    move |input| {
-        let start = input;
-        let (input, _) = tag("(")(input)?;
-        let (input, _) = whitespace(input)?;
-        let (input, ty) = opt(crate::v1_parser::identifier(&kdl_parser.0))(input)?;
-        let (input, _) = context("closing ')' for type annotation", cut(tag(")")))(input)
-            .map_err(|e| set_details(e, start, Some("annotation"), Some("annotations can only be KDL identifiers (including string identifiers), and can't have any space inside the parentheses.")))?;
-        Ok((
-            input,
-            KdlQueryMatcherDetails {
-                op: KdlQueryAttributeOp::Equal,
-                value: ty.map(|ident| KdlValue::String(ident.value().to_owned())),
-                accessor: KdlQueryMatcherAccessor::Annotation,
-            },
-        ))
-    }
-}
-
-fn scope_accessor(input: &str) -> IResult<&str, KdlQueryMatcherAccessor, KdlParseError<&str>> {
-    let start = input;
-    let (input, _) = tag("scope(")(input)?;
-    let (input, _) = context(
-        "a valid scope accessor",
-        cut(preceded(whitespace, tag(")"))),
-    )(input)
-    .map_err(|e| set_details(e, start, Some("partial scope accessor"), None))?;
-    Ok((input, KdlQueryMatcherAccessor::Scope))
-}
-
-fn accessor<'a: 'b, 'b>(
-    kdl_parser: &'b KdlQueryParser<'a>,
-) -> impl Fn(&'a str) -> IResult<&'a str, KdlQueryMatcherAccessor, KdlParseError<&'a str>> + 'b {
-    move |input| {
-        let (input, accessor) = alt((
-            type_accessor,
-            arg_accessor,
-            prop_accessor(kdl_parser),
-            prop_name_accessor(kdl_parser),
-            bad_accessor(kdl_parser),
-        ))(input)?;
-
-        Ok((input, accessor))
-    }
-}
-
-fn type_accessor(input: &str) -> IResult<&str, KdlQueryMatcherAccessor, KdlParseError<&str>> {
-    let start = input;
-    let (input, _) = tag("type")(input)?;
-    let (input, _) = context(
-        "an opening '(' for a 'type()' accessor",
-        preceded(whitespace, tag("(")),
-    )(input)
-    .map_err(|e| set_details(e, start, Some("partial type accessor"), None))?;
-    let (input, _) = context(
-        "a closing ')' for this 'type()' accessor",
-        cut(preceded(whitespace, tag(")"))),
-    )(input)
-    .map_err(|e| {
-        set_details(
-            e,
-            start,
-            Some("partial type accessor"),
-            Some("type() accessors don't take any arguments. Use e.g. [type() = \"foo\"] instead."),
-        )
-    })?;
-    Ok((input, KdlQueryMatcherAccessor::Annotation))
-}
-
-fn arg_accessor(input: &str) -> IResult<&str, KdlQueryMatcherAccessor, KdlParseError<&str>> {
-    let (input, _) = tag("arg")(input)?;
-    let (input, arg) = parenthesized_arg(input)?;
-    if let Some(arg) = arg {
-        if let Some(index) = arg
-            .as_i64()
-            .and_then(|arg| -> Option<usize> { arg.try_into().ok() })
-        {
-            Ok((input, KdlQueryMatcherAccessor::Arg(Some(index))))
-        } else {
-            Err(nom::Err::Error(KdlParseError {
-                input,
-                len: 0,
-                kind: None,
-                label: Some("arg accessor"),
-                help: Some("arg accessor must be an integer"),
-                touched: false,
-                context: Some("a valid arg accessor"),
-            }))
-        }
-    } else {
-        Ok((input, KdlQueryMatcherAccessor::Arg(None)))
-    }
-}
-
-fn prop_name_accessor<'a: 'b, 'b>(
-    kdl_parser: &'b KdlQueryParser<'a>,
-) -> impl Fn(&'a str) -> IResult<&'a str, KdlQueryMatcherAccessor, KdlParseError<&'a str>> + 'b {
-    move |input| {
-        let start = input;
-        let (input, prop_name) = crate::v1_parser::identifier(&kdl_parser.0)(input)?;
-        let (_, paren) = opt(preceded(whitespace, tag("(")))(input)?;
-        if paren.is_some() {
-            Err(nom::Err::Error(KdlParseError {
-                input: start,
-                len: 0,
-                kind: None,
-                label: Some("accessor"),
-                help: Some("accessor must be one of: type(), arg(), prop(), propname"),
-                touched: false,
-                context: Some("a valid accessor"),
-            }))
-        } else {
-            Ok((
-                input,
-                KdlQueryMatcherAccessor::Prop(prop_name.value().to_owned()),
-            ))
-        }
-    }
-}
-
-fn prop_accessor<'a: 'b, 'b>(
-    kdl_parser: &'b KdlQueryParser<'a>,
-) -> impl Fn(&'a str) -> IResult<&'a str, KdlQueryMatcherAccessor, KdlParseError<&'a str>> + 'b {
-    move |input| {
-        let (input, _) = tag("prop")(input)?;
-        let (input, val) = parenthesized_prop(kdl_parser)(input)?;
-        Ok((input, KdlQueryMatcherAccessor::Prop(val)))
-    }
-}
-
-fn parenthesized_arg(input: &str) -> IResult<&str, Option<KdlValue>, KdlParseError<&str>> {
-    let (input, _) = tag("(")(input)?;
-    let (input, maybe_value) = opt(value)(input)?;
-    let (input, _) = tag(")")(input)?;
-
-    if let Some((_, val)) = maybe_value {
-        Ok((input, Some(val)))
-    } else {
-        Ok((input, None))
-    }
-}
-
-fn parenthesized_prop<'a: 'b, 'b>(
-    kdl_parser: &'b KdlQueryParser<'a>,
-) -> impl Fn(&'a str) -> IResult<&'a str, String, KdlParseError<&'a str>> + 'b {
-    move |input| {
-        let (input, _) = tag("(")(input)?;
-        let (input, prop) = crate::v1_parser::identifier(&kdl_parser.0)(input)?;
-        let (input, _) = tag(")")(input)?;
-        Ok((input, prop.value().to_owned()))
-    }
-}
-
-fn bad_accessor<'a: 'b, 'b>(
-    kdl_parser: &'b KdlQueryParser<'a>,
-) -> impl Fn(&'a str) -> IResult<&'a str, KdlQueryMatcherAccessor, KdlParseError<&'a str>> + 'b {
-    move |input| {
-        let start = input;
-
-        let (input, scope) = opt(preceded(
-            tag("scope"),
-            preceded(
-                whitespace,
-                opt(terminated(tag("("), opt(preceded(whitespace, tag(")"))))),
-            ),
-        ))(input)?;
-
-        if scope.is_some() {
-            return Err(nom::Err::Failure(KdlParseError {
-                input: start,
-                len: start.len() - input.len(),
-                kind: None,
-                label: Some("incorrect scope() accessor"),
-                help: Some("Accessors must be one of: type(), arg(), prop(), propname"),
-                touched: false,
-                context: Some(
-                    "'scope()' to be the first item only at the top level of the query selector",
-                ),
             }));
         }
 
-        let (input, ident) = opt(terminated(
-            crate::v1_parser::identifier(&kdl_parser.0),
-            preceded(
-                whitespace,
-                terminated(tag("("), opt(preceded(whitespace, tag(")")))),
-            ),
-        ))(input)?;
-
-        if let Some(ident) = ident {
-            match ident.value() {
-                "type" | "arg" | "prop" | "val" => {}
-                _ => {
-                    return Err(nom::Err::Failure(KdlParseError {
-                        input: start,
-                        len: start.len() - input.len(),
-                        kind: None,
-                        label: Some("invalid attribute accessor"),
-                        help: Some("Accessors must be one of: type(), arg(), prop(), propname"),
-                        touched: false,
-                        context: Some("a valid attribute accessor"),
-                    }));
-                }
-            }
-        }
-
-        Err(nom::Err::Error(KdlParseError {
-            input: start,
-            len: 0,
-            kind: None,
-            label: Some("accessor"),
-            help: Some("accessor must be one of: type(), arg(), prop(), propname"),
-            touched: false,
-            context: Some("a valid accessor"),
-        }))
+        Ok(matchers)
     }
 }
 
-fn whitespace(input: &str) -> IResult<&str, &str, KdlParseError<&str>> {
-    recognize(many0(alt((
-        crate::v1_parser::unicode_space,
-        crate::v1_parser::newline,
-    ))))(input)
+/// Parse `scope()` accessor.
+fn scope_accessor(input: &mut Input<'_>) -> PResult<()> {
+    ("scope(", wss, ")").void().parse_next(input)
+}
+
+/// Parse annotation/type matcher `(type)`.
+fn annotation_matcher(input: &mut Input<'_>) -> PResult<KdlQueryMatcherDetails> {
+    delimited("(", (wss, opt(identifier), wss), ")")
+        .map(|(_, ty, _)| KdlQueryMatcherDetails {
+            op: KdlQueryAttributeOp::Equal,
+            value: ty.map(KdlValue::String),
+            accessor: KdlQueryMatcherAccessor::Annotation,
+        })
+        .parse_next(input)
+}
+
+/// Parse attribute matcher `[...]`.
+fn attribute_matcher(input: &mut Input<'_>) -> PResult<KdlQueryMatcherDetails> {
+    delimited(
+        "[",
+        (wss, attribute_matcher_inner, wss),
+        cut_err("]").context("closing ']'"),
+    )
+    .map(|(_, m, _)| m)
+    .parse_next(input)
+}
+
+/// Parse inner content of attribute matcher.
+fn attribute_matcher_inner(input: &mut Input<'_>) -> PResult<KdlQueryMatcherDetails> {
+    let accessor = opt(accessor).parse_next(input)?;
+
+    if let Some(xsr) = accessor {
+        wss.parse_next(input)?;
+        let op = opt(attribute_op).parse_next(input)?;
+        wss.parse_next(input)?;
+
+        if let Some(op) = op {
+            let value = opt(kdl_value).parse_next(input)?;
+            if let Some(value) = value {
+                // String operators require string values
+                if matches!(
+                    op,
+                    KdlQueryAttributeOp::StartsWith
+                        | KdlQueryAttributeOp::EndsWith
+                        | KdlQueryAttributeOp::Contains
+                ) && !matches!(value, KdlValue::String(_))
+                {
+                    return Err(ErrMode::Cut(QueryParseError {
+                        message: Some("String operators require string values".into()),
+                        label: Some("non-string value".into()),
+                        help: Some("Use ^=, $=, *= only with strings".into()),
+                        offset: input.location(),
+                        len: 1,
+                    }));
+                }
+                Ok(KdlQueryMatcherDetails {
+                    op,
+                    value: Some(value),
+                    accessor: xsr,
+                })
+            } else {
+                Err(ErrMode::Cut(QueryParseError {
+                    message: Some("Expected value after operator".into()),
+                    label: Some("operator value".into()),
+                    help: Some("Provide a valid KDL value".into()),
+                    offset: input.location(),
+                    len: 0,
+                }))
+            }
+        } else {
+            Ok(KdlQueryMatcherDetails {
+                op: KdlQueryAttributeOp::Equal,
+                value: None,
+                accessor: xsr,
+            })
+        }
+    } else {
+        Ok(KdlQueryMatcherDetails {
+            op: KdlQueryAttributeOp::Equal,
+            value: None,
+            accessor: KdlQueryMatcherAccessor::Node,
+        })
+    }
+}
+
+/// Parse attribute operator.
+fn attribute_op(input: &mut Input<'_>) -> PResult<KdlQueryAttributeOp> {
+    alt((
+        "!=".map(|_| KdlQueryAttributeOp::NotEqual),
+        ">=".map(|_| KdlQueryAttributeOp::Gte),
+        "<=".map(|_| KdlQueryAttributeOp::Lte),
+        "^=".map(|_| KdlQueryAttributeOp::StartsWith),
+        "$=".map(|_| KdlQueryAttributeOp::EndsWith),
+        "*=".map(|_| KdlQueryAttributeOp::Contains),
+        "=".map(|_| KdlQueryAttributeOp::Equal),
+        ">".map(|_| KdlQueryAttributeOp::Gt),
+        "<".map(|_| KdlQueryAttributeOp::Lt),
+    ))
+    .parse_next(input)
+}
+
+/// Parse an accessor: `type()`, `arg()`, `arg(n)`, `prop(name)`, or bare property name.
+fn accessor(input: &mut Input<'_>) -> PResult<KdlQueryMatcherAccessor> {
+    alt((
+        type_accessor,
+        arg_accessor,
+        prop_accessor,
+        prop_name_accessor,
+    ))
+    .parse_next(input)
+}
+
+/// Parse `type()` accessor.
+fn type_accessor(input: &mut Input<'_>) -> PResult<KdlQueryMatcherAccessor> {
+    ("type", wss, "(", wss, ")")
+        .map(|_| KdlQueryMatcherAccessor::Annotation)
+        .parse_next(input)
+}
+
+/// Parse `arg()` or `arg(n)` accessor.
+fn arg_accessor(input: &mut Input<'_>) -> PResult<KdlQueryMatcherAccessor> {
+    preceded("arg", delimited("(", (wss, opt(integer), wss), ")"))
+        .map(|(_, idx, _)| KdlQueryMatcherAccessor::Arg(idx))
+        .parse_next(input)
+}
+
+/// Parse `prop(name)` accessor.
+fn prop_accessor(input: &mut Input<'_>) -> PResult<KdlQueryMatcherAccessor> {
+    preceded("prop", delimited("(", (wss, identifier, wss), ")"))
+        .map(|(_, name, _)| KdlQueryMatcherAccessor::Prop(name))
+        .parse_next(input)
+}
+
+/// Parse bare property name accessor.
+fn prop_name_accessor(input: &mut Input<'_>) -> PResult<KdlQueryMatcherAccessor> {
+    // Make sure it's not followed by `(` which would indicate a function call
+    terminated(identifier, peek(not_paren))
+        .map(KdlQueryMatcherAccessor::Prop)
+        .parse_next(input)
+}
+
+/// Check that next char is not `(`
+fn not_paren(input: &mut Input<'_>) -> PResult<()> {
+    if input.starts_with("(") {
+        Err(ErrMode::Backtrack(QueryParseError::default()))
+    } else {
+        Ok(())
+    }
+}
+
+/// Parse a simple identifier (for property names, node names).
+fn identifier(input: &mut Input<'_>) -> PResult<String> {
+    alt((quoted_identifier, bare_identifier)).parse_next(input)
+}
+
+/// Parse a bare identifier.
+fn bare_identifier(input: &mut Input<'_>) -> PResult<String> {
+    take_while(1.., |c: char| {
+        !c.is_whitespace()
+            && !matches!(
+                c,
+                '(' | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | ','
+                    | '='
+                    | '>'
+                    | '<'
+                    | '!'
+                    | '^'
+                    | '$'
+                    | '*'
+                    | '"'
+                    | '\''
+            )
+    })
+    .map(|s: &str| s.to_string())
+    .parse_next(input)
+}
+
+/// Parse a quoted identifier.
+fn quoted_identifier(input: &mut Input<'_>) -> PResult<String> {
+    delimited('"', take_while(0.., |c| c != '"'), '"')
+        .map(|s: &str| s.to_string())
+        .parse_next(input)
+}
+
+/// Parse an integer for arg(n).
+fn integer(input: &mut Input<'_>) -> PResult<usize> {
+    take_while(1.., |c: char| c.is_ascii_digit())
+        .verify_map(|s: &str| s.parse::<usize>().ok())
+        .parse_next(input)
+}
+
+/// Parse a KDL value (simplified for query context).
+fn kdl_value(input: &mut Input<'_>) -> PResult<KdlValue> {
+    alt((
+        // Boolean keywords
+        "#true".map(|_| KdlValue::Bool(true)),
+        "#false".map(|_| KdlValue::Bool(false)),
+        "true".map(|_| KdlValue::Bool(true)),
+        "false".map(|_| KdlValue::Bool(false)),
+        // Null
+        "#null".map(|_| KdlValue::Null),
+        "null".map(|_| KdlValue::Null),
+        // Special floats
+        "#inf".map(|_| KdlValue::Float(f64::INFINITY)),
+        "#-inf".map(|_| KdlValue::Float(f64::NEG_INFINITY)),
+        "#nan".map(|_| KdlValue::Float(f64::NAN)),
+        // String
+        quoted_string,
+        // Number (float or integer)
+        number,
+    ))
+    .parse_next(input)
+}
+
+/// Parse a quoted string value.
+fn quoted_string(input: &mut Input<'_>) -> PResult<KdlValue> {
+    delimited('"', take_while(0.., |c| c != '"'), '"')
+        .map(|s: &str| KdlValue::String(s.to_string()))
+        .parse_next(input)
+}
+
+/// Parse a number (integer or float).
+fn number(input: &mut Input<'_>) -> PResult<KdlValue> {
+    let sign = opt(one_of(['+', '-'])).parse_next(input)?;
+    let digits: &str =
+        take_while(1.., |c: char| c.is_ascii_digit() || c == '.').parse_next(input)?;
+
+    let s = if let Some(sign) = sign {
+        format!("{}{}", sign, digits)
+    } else {
+        digits.to_string()
+    };
+
+    if s.contains('.') {
+        s.parse::<f64>()
+            .map(KdlValue::Float)
+            .map_err(|_| ErrMode::Backtrack(QueryParseError::default()))
+    } else {
+        s.parse::<i128>()
+            .map(KdlValue::Integer)
+            .map_err(|_| ErrMode::Backtrack(QueryParseError::default()))
+    }
+}
+
+/// Whitespace (zero or more).
+fn wss(input: &mut Input<'_>) -> PResult<()> {
+    repeat(0.., ws).parse_next(input)
+}
+
+/// Single whitespace character.
+fn ws(input: &mut Input<'_>) -> PResult<()> {
+    alt((unicode_space, newline)).parse_next(input)
+}
+
+static UNICODE_SPACES: [char; 18] = [
+    '\u{0009}', '\u{0020}', '\u{00A0}', '\u{1680}', '\u{2000}', '\u{2001}', '\u{2002}', '\u{2003}',
+    '\u{2004}', '\u{2005}', '\u{2006}', '\u{2007}', '\u{2008}', '\u{2009}', '\u{200A}', '\u{202F}',
+    '\u{205F}', '\u{3000}',
+];
+
+fn unicode_space(input: &mut Input<'_>) -> PResult<()> {
+    one_of(UNICODE_SPACES).void().parse_next(input)
+}
+
+static NEWLINES: [&str; 7] = [
+    "\r\n", "\r", "\n", "\u{0085}", "\u{000C}", "\u{2028}", "\u{2029}",
+];
+
+fn newline(input: &mut Input<'_>) -> PResult<()> {
+    alt(NEWLINES).void().parse_next(input)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_simple_node() {
+        let q = parse_query("foo").unwrap();
+        assert_eq!(q.0.len(), 1);
+    }
+
+    #[test]
+    fn parse_node_with_type() {
+        let q = parse_query("(string)foo").unwrap();
+        assert_eq!(q.0.len(), 1);
+    }
+
+    #[test]
+    fn parse_node_with_attribute() {
+        let q = parse_query("foo[bar]").unwrap();
+        assert_eq!(q.0.len(), 1);
+    }
+
+    #[test]
+    fn parse_node_with_attribute_value() {
+        let q = parse_query(r#"foo[bar="baz"]"#).unwrap();
+        assert_eq!(q.0.len(), 1);
+    }
+
+    #[test]
+    fn parse_child_combinator() {
+        let q = parse_query("foo > bar").unwrap();
+        assert_eq!(q.0.len(), 1);
+        assert_eq!(q.0[0].0.len(), 2);
+    }
+
+    #[test]
+    fn parse_descendant_combinator() {
+        let q = parse_query("foo >> bar").unwrap();
+        assert_eq!(q.0.len(), 1);
+    }
+
+    #[test]
+    fn parse_multiple_selectors() {
+        let q = parse_query("foo, bar").unwrap();
+        assert_eq!(q.0.len(), 2);
+    }
+
+    #[test]
+    fn parse_scope() {
+        let q = parse_query("scope()").unwrap();
+        assert_eq!(q.0.len(), 1);
+    }
+
+    #[test]
+    fn parse_arg_accessor() {
+        let q = parse_query("[arg(0)]").unwrap();
+        assert_eq!(q.0.len(), 1);
+    }
+
+    #[test]
+    fn parse_prop_accessor() {
+        let q = parse_query("[prop(name)]").unwrap();
+        assert_eq!(q.0.len(), 1);
+    }
+
+    #[test]
+    fn parse_type_accessor() {
+        let q = parse_query(r#"[type()="string"]"#).unwrap();
+        assert_eq!(q.0.len(), 1);
+    }
+
+    #[test]
+    fn parse_numeric_comparison() {
+        let q = parse_query("[arg(0) >= 10]").unwrap();
+        assert_eq!(q.0.len(), 1);
+    }
 }

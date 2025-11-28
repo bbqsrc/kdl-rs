@@ -1,6 +1,28 @@
+//! KQL (KDL Query Language) implementation for querying KDL documents.
+//!
+//! This module provides a CSS Selectors-style query language for picking out
+//! nodes from a KDL document. For the full specification, see the
+//! [KQL spec](https://github.com/kdl-org/kdl/blob/main/QUERY-SPEC.md).
+//!
+//! # Example
+//!
+//! ```rust
+//! use kdl::KdlDocument;
+//!
+//! let doc: KdlDocument = r#"
+//! a {
+//!     b 1
+//!     c 2
+//! }
+//! "#.parse().unwrap();
+//!
+//! let node = doc.query("a > b").unwrap();
+//! assert!(node.is_some());
+//! ```
+
 use std::{collections::VecDeque, str::FromStr, sync::Arc};
 
-use crate::{query_parser::KdlQueryParser, KdlDiagnostic, KdlDocument, KdlNode, KdlValue};
+use crate::{KdlDiagnostic, KdlDocument, KdlNode, KdlValue};
 
 /// A parsed KQL query. For details on the syntax, see the [KQL
 /// spec](https://github.com/kdl-org/kdl/blob/main/QUERY-SPEC.md).
@@ -11,8 +33,7 @@ impl FromStr for KdlQuery {
     type Err = KdlDiagnostic;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let parser = KdlQueryParser::new(s);
-        parser.parse(crate::query_parser::query(&parser))
+        crate::query_parser::parse_query(s)
     }
 }
 
@@ -191,7 +212,7 @@ impl KdlQueryMatcherDetails {
 
         match (&self.accessor, &self.op, &self.value) {
             (Scope, _, _) => false,
-            (Annotation | Node, op, Some(KdlValue::String(s) | KdlValue::RawString(s))) => {
+            (Annotation | Node, op, Some(KdlValue::String(s))) => {
                 let lhs = match &self.accessor {
                     Annotation => node.ty().map(|ty| ty.value()),
                     Node => Some(node.name().value()),

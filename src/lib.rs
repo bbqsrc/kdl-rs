@@ -203,12 +203,16 @@ mod fmt;
 mod identifier;
 mod node;
 // mod nom_compat;
-// mod query;
-// mod query_parser;
 // mod v1_parser;
 mod value;
 
 mod v2_parser;
 
+pub mod query;
+mod query_parser;
+
 #[cfg(feature = "schema")]
 pub mod schema;
+
+#[cfg(feature = "schema-v2")]
+pub mod schema_v2;

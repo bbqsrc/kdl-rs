@@ -4,7 +4,7 @@ use std::fmt::Display;
 
 #[cfg(feature = "v1")]
 use crate::KdlNodeFormat;
-use crate::{FormatConfig, KdlError, KdlNode, KdlValue};
+use crate::{FormatConfig, KdlDiagnostic, KdlError, KdlNode, KdlValue, NodeKey};
 
 /// Represents a KDL
 /// [`Document`](https://github.com/kdl-org/kdl/blob/main/SPEC.md#document).
@@ -272,70 +272,79 @@ impl KdlDocument {
     //
     // /// Queries this Document's children according to the KQL query language,
     // /// returning an iterator over all matching nodes.
-    // ///
-    // /// # NOTE
-    // ///
-    // /// Any query selectors that try to select the toplevel `scope()` will
-    // /// fail to match when using this method, since there's no [`KdlNode`] to
-    // /// return in this case.
-    // pub fn query_all(
-    //     &self,
-    //     query: impl IntoKdlQuery,
-    // ) -> Result<KdlQueryIterator<'_>, KdlDiagnostic> {
-    //     let parsed = query.into_query()?;
-    //     Ok(KdlQueryIterator::new(None, Some(self), parsed))
-    // }
+    /// Queries this Document's children according to the KQL query language,
+    /// returning an iterator over all matches.
+    ///
+    /// # NOTE
+    ///
+    /// Any query selectors that try to select the toplevel `scope()` will
+    /// fail to match when using this method, since there's no [`KdlNode`] to
+    /// return in this case.
+    pub fn query_all(
+        &self,
+        query: impl crate::query::IntoKdlQuery,
+    ) -> Result<crate::query::KdlQueryIterator<'_>, KdlDiagnostic> {
+        let parsed = query.into_query()?;
+        Ok(crate::query::KdlQueryIterator::new(
+            None,
+            Some(self),
+            parsed,
+        ))
+    }
 
-    // /// Queries this Document's children according to the KQL query language,
-    // /// returning the first match, if any.
-    // ///
-    // /// # NOTE
-    // ///
-    // /// Any query selectors that try to select the toplevel `scope()` will
-    // /// fail to match when using this method, since there's no [`KdlNode`] to
-    // /// return in this case.
-    // pub fn query(&self, query: impl IntoKdlQuery) -> Result<Option<&KdlNode>, KdlDiagnostic> {
-    //     let mut iter = self.query_all(query)?;
-    //     Ok(iter.next())
-    // }
+    /// Queries this Document's children according to the KQL query language,
+    /// returning the first match, if any.
+    ///
+    /// # NOTE
+    ///
+    /// Any query selectors that try to select the toplevel `scope()` will
+    /// fail to match when using this method, since there's no [`KdlNode`] to
+    /// return in this case.
+    pub fn query(
+        &self,
+        query: impl crate::query::IntoKdlQuery,
+    ) -> Result<Option<&KdlNode>, KdlDiagnostic> {
+        let mut iter = self.query_all(query)?;
+        Ok(iter.next())
+    }
 
-    // /// Queries this Document's children according to the KQL query language,
-    // /// picking the first match, and calling `.get(key)` on it, if the query
-    // /// succeeded.
-    // ///
-    // /// # NOTE
-    // ///
-    // /// Any query selectors that try to select the toplevel `scope()` will
-    // /// fail to match when using this method, since there's no [`KdlNode`] to
-    // /// return in this case.
-    // pub fn query_get(
-    //     &self,
-    //     query: impl IntoKdlQuery,
-    //     key: impl Into<NodeKey>,
-    // ) -> Result<Option<&KdlValue>, KdlDiagnostic> {
-    //     Ok(self.query(query)?.and_then(|node| node.get(key)))
-    // }
+    /// Queries this Document's children according to the KQL query language,
+    /// picking the first match, and calling `.get(key)` on it, if the query
+    /// succeeded.
+    ///
+    /// # NOTE
+    ///
+    /// Any query selectors that try to select the toplevel `scope()` will
+    /// fail to match when using this method, since there's no [`KdlNode`] to
+    /// return in this case.
+    pub fn query_get(
+        &self,
+        query: impl crate::query::IntoKdlQuery,
+        key: impl Into<NodeKey>,
+    ) -> Result<Option<&KdlValue>, KdlDiagnostic> {
+        Ok(self.query(query)?.and_then(|node| node.get(key)))
+    }
 
-    // /// Queries this Document's children according to the KQL query language,
-    // /// returning an iterator over all matching nodes, returning the requested
-    // /// field from each of those nodes and filtering out nodes that don't have
-    // /// it.
-    // ///
-    // /// # NOTE
-    // ///
-    // /// Any query selectors that try to select the toplevel `scope()` will
-    // /// fail to match when using this method, since there's no [`KdlNode`] to
-    // /// return in this case.
-    // pub fn query_get_all(
-    //     &self,
-    //     query: impl IntoKdlQuery,
-    //     key: impl Into<NodeKey>,
-    // ) -> Result<impl Iterator<Item = &KdlValue>, KdlDiagnostic> {
-    //     let key: NodeKey = key.into();
-    //     Ok(self
-    //         .query_all(query)?
-    //         .filter_map(move |node| node.get(key.clone())))
-    // }
+    /// Queries this Document's children according to the KQL query language,
+    /// returning an iterator over all matching nodes, returning the requested
+    /// field from each of those nodes and filtering out nodes that don't have
+    /// it.
+    ///
+    /// # NOTE
+    ///
+    /// Any query selectors that try to select the toplevel `scope()` will
+    /// fail to match when using this method, since there's no [`KdlNode`] to
+    /// return in this case.
+    pub fn query_get_all(
+        &self,
+        query: impl crate::query::IntoKdlQuery,
+        key: impl Into<NodeKey>,
+    ) -> Result<impl Iterator<Item = &KdlValue>, KdlDiagnostic> {
+        let key: NodeKey = key.into();
+        Ok(self
+            .query_all(query)?
+            .filter_map(move |node| node.get(key.clone())))
+    }
 
     /// Parses a string into a document.
     ///

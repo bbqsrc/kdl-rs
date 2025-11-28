@@ -15,6 +15,7 @@ edition = "2021"
 default = ["span"]
 span = []
 schema = ["regex", "jiff"]
+schema-v2 = ["regex", "jiff"]
 v1-fallback = ["v1"]
 v1 = ["kdlv1"]
 
