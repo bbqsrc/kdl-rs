@@ -53,12 +53,63 @@ mod validate;
 
 pub use types::ValueFormat;
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[cfg(feature = "span")]
 use miette::SourceSpan;
 
 use crate::{KdlDiagnostic, KdlDocument, KdlError, KdlNode};
+
+/// A schema directive extracted from a document's `@ksl:schema` node.
+///
+/// Documents can reference one or more schemas using the `@ksl:schema` directive.
+/// Per spec, ALL referenced schemas must validate for the document to pass.
+#[derive(Debug, Clone)]
+pub struct SchemaDirective {
+    /// Path to the schema file (may be relative or absolute)
+    pub path: String,
+    /// Span of the directive in the source document
+    #[cfg(feature = "span")]
+    pub span: SourceSpan,
+    /// Whether validation failures should produce warnings instead of errors
+    pub warn_only: bool,
+}
+
+/// How schemas were specified for a document.
+#[derive(Debug, Clone)]
+pub enum SchemaSource {
+    /// From `@ksl:schema` directive(s) in the document.
+    /// Per spec: ALL schemas must validate for the document to pass.
+    Directives(Vec<SchemaDirective>),
+    /// No schema directive found in the document.
+    None,
+}
+
+/// Result of validating a document against its `@ksl:schema` directives.
+#[derive(Debug, Clone, Default)]
+pub struct ValidationResult {
+    /// All diagnostics from all schemas
+    pub diagnostics: Vec<KdlDiagnostic>,
+    /// Schema paths that were successfully loaded and validated
+    pub validated_schemas: Vec<PathBuf>,
+    /// Schema paths that failed to load (resolved path, original path string)
+    pub failed_schemas: Vec<(PathBuf, String)>,
+}
+
+/// Resolve a schema path relative to a document's directory.
+///
+/// If the path is absolute, it is returned unchanged.
+/// If relative, it is resolved against `document_dir` and canonicalized.
+pub fn resolve_schema_path(schema_path: &str, document_dir: &Path) -> PathBuf {
+    let path = Path::new(schema_path);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        let resolved = document_dir.join(path);
+        resolved.canonicalize().unwrap_or(resolved)
+    }
+}
 
 /// A KDL Schema v2 used for validating KDL documents.
 ///
@@ -119,6 +170,32 @@ impl KdlSchemaV2 {
         Self::new(doc, input)
     }
 
+    /// Load and parse a schema from a file path.
+    ///
+    /// # Errors
+    /// Returns an error if the file cannot be read or if parsing fails.
+    pub fn load_from_path(path: &Path) -> Result<Self, KdlError> {
+        let content = std::fs::read_to_string(path).map_err(|e| KdlError {
+            input: Arc::new(String::new()),
+            diagnostics: vec![KdlDiagnostic {
+                input: Arc::new(String::new()),
+                #[cfg(feature = "span")]
+                span: SourceSpan::new(0.into(), 0),
+                #[cfg(not(feature = "span"))]
+                span: miette::SourceSpan::new(0.into(), 0),
+                message: Some(format!(
+                    "Failed to read schema file '{}': {}",
+                    path.display(),
+                    e
+                )),
+                label: None,
+                help: None,
+                severity: miette::Severity::Error,
+            }],
+        })?;
+        Self::parse(&content)
+    }
+
     /// Validates a KDL document against this schema.
     ///
     /// Returns a list of validation diagnostics. An empty list means
@@ -162,6 +239,145 @@ impl KdlSchemaV2 {
     pub(crate) fn definitions(&self) -> Option<&KdlNode> {
         self.doc.get("definitions")
     }
+
+    /// Extract `@ksl:schema` directives from a KDL document.
+    ///
+    /// This finds all `@ksl:schema` nodes in the document and extracts their
+    /// schema paths and options. Per spec, multiple schemas can be specified
+    /// and ALL must validate for the document to pass.
+    ///
+    /// # Example
+    ///
+    /// ```kdl
+    /// @ksl:schema "schema.kdl"
+    /// @ksl:schema "extra.kdl" warn-only=#true
+    /// ```
+    pub fn extract_directives(doc: &KdlDocument) -> SchemaSource {
+        let mut directives = Vec::new();
+
+        for node in doc.nodes() {
+            if node.name().value() == "@ksl:schema" {
+                #[cfg(feature = "span")]
+                let span = node.span();
+
+                let warn_only = node
+                    .entry("warn-only")
+                    .and_then(|e| e.value().as_bool())
+                    .unwrap_or(false);
+
+                // Each positional argument is a schema path
+                for entry in node.entries() {
+                    if entry.name().is_none() {
+                        if let Some(path) = entry.value().as_string() {
+                            directives.push(SchemaDirective {
+                                path: path.to_string(),
+                                #[cfg(feature = "span")]
+                                span,
+                                warn_only,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        if directives.is_empty() {
+            SchemaSource::None
+        } else {
+            SchemaSource::Directives(directives)
+        }
+    }
+
+    /// Validates a KDL document against this schema, with severity control.
+    ///
+    /// If `warn_only` is true, all errors are downgraded to warnings.
+    /// This is used when the `@ksl:schema` directive has `warn-only=#true`.
+    pub fn validate_with_severity(
+        &self,
+        target: &KdlDocument,
+        warn_only: bool,
+    ) -> Vec<KdlDiagnostic> {
+        let mut diags = self.validate(target);
+        if warn_only {
+            for diag in &mut diags {
+                if diag.severity == miette::Severity::Error {
+                    diag.severity = miette::Severity::Warning;
+                }
+            }
+        }
+        diags
+    }
+}
+
+/// Validate a document against all its `@ksl:schema` directives.
+///
+/// This extracts schema directives from the document, loads each schema,
+/// and validates the document against all of them. Per spec, ALL schemas
+/// must pass for the document to be valid.
+///
+/// # Arguments
+/// * `doc` - The document to validate
+/// * `document_dir` - Directory containing the document (for resolving relative paths)
+///
+/// # Returns
+/// A [`ValidationResult`] containing all diagnostics and status of each schema.
+pub fn validate_with_directives(doc: &KdlDocument, document_dir: &Path) -> ValidationResult {
+    let mut result = ValidationResult::default();
+
+    let source = KdlSchemaV2::extract_directives(doc);
+
+    match source {
+        SchemaSource::Directives(directives) => {
+            for directive in directives {
+                let schema_path = resolve_schema_path(&directive.path, document_dir);
+
+                match KdlSchemaV2::load_from_path(&schema_path) {
+                    Ok(schema) => {
+                        let diags = schema.validate_with_severity(doc, directive.warn_only);
+                        result.diagnostics.extend(diags);
+                        result.validated_schemas.push(schema_path);
+                    }
+                    Err(e) => {
+                        let msg = format!(
+                            "Failed to load schema '{}': {}",
+                            directive.path,
+                            e.diagnostics
+                                .first()
+                                .and_then(|d| d.message.as_ref())
+                                .map(|s| s.as_str())
+                                .unwrap_or("unknown error")
+                        );
+
+                        let severity = if directive.warn_only {
+                            miette::Severity::Warning
+                        } else {
+                            miette::Severity::Error
+                        };
+
+                        result.diagnostics.push(KdlDiagnostic {
+                            input: Arc::new(String::new()),
+                            #[cfg(feature = "span")]
+                            span: directive.span,
+                            #[cfg(not(feature = "span"))]
+                            span: miette::SourceSpan::new(0.into(), 0),
+                            message: Some(msg),
+                            label: Some("schema directive".into()),
+                            help: Some("Check that the schema file exists and is valid".into()),
+                            severity,
+                        });
+                        result
+                            .failed_schemas
+                            .push((schema_path, directive.path.clone()));
+                    }
+                }
+            }
+        }
+        SchemaSource::None => {
+            // No directives - nothing to validate
+        }
+    }
+
+    result
 }
 
 #[cfg(test)]
@@ -1407,5 +1623,343 @@ document {
 "#;
         let schema = KdlSchemaV2::parse(schema_src).unwrap();
         assert_eq!(schema.metadata_id(), None);
+    }
+
+    // Tests for directive extraction and path resolution
+
+    #[test]
+    fn test_extract_single_directive() {
+        let doc_src = r#"
+@ksl:schema "schema.kdl"
+test
+"#;
+        let doc: KdlDocument = doc_src.parse().unwrap();
+        let source = KdlSchemaV2::extract_directives(&doc);
+
+        match source {
+            SchemaSource::Directives(directives) => {
+                assert_eq!(directives.len(), 1);
+                assert_eq!(directives[0].path, "schema.kdl");
+                assert!(!directives[0].warn_only);
+            }
+            SchemaSource::None => panic!("Expected Directives"),
+        }
+    }
+
+    #[test]
+    fn test_extract_multiple_directives() {
+        let doc_src = r#"
+@ksl:schema "schema1.kdl"
+@ksl:schema "schema2.kdl"
+test
+"#;
+        let doc: KdlDocument = doc_src.parse().unwrap();
+        let source = KdlSchemaV2::extract_directives(&doc);
+
+        match source {
+            SchemaSource::Directives(directives) => {
+                assert_eq!(directives.len(), 2);
+                assert_eq!(directives[0].path, "schema1.kdl");
+                assert_eq!(directives[1].path, "schema2.kdl");
+            }
+            SchemaSource::None => panic!("Expected Directives"),
+        }
+    }
+
+    #[test]
+    fn test_extract_multiple_paths() {
+        let doc_src = r#"
+@ksl:schema "schema1.kdl" "schema2.kdl"
+test
+"#;
+        let doc: KdlDocument = doc_src.parse().unwrap();
+        let source = KdlSchemaV2::extract_directives(&doc);
+
+        match source {
+            SchemaSource::Directives(directives) => {
+                assert_eq!(directives.len(), 2);
+                assert_eq!(directives[0].path, "schema1.kdl");
+                assert_eq!(directives[1].path, "schema2.kdl");
+            }
+            SchemaSource::None => panic!("Expected Directives"),
+        }
+    }
+
+    #[test]
+    fn test_extract_warn_only() {
+        let doc_src = r#"
+@ksl:schema "schema.kdl" warn-only=#true
+test
+"#;
+        let doc: KdlDocument = doc_src.parse().unwrap();
+        let source = KdlSchemaV2::extract_directives(&doc);
+
+        match source {
+            SchemaSource::Directives(directives) => {
+                assert_eq!(directives.len(), 1);
+                assert_eq!(directives[0].path, "schema.kdl");
+                assert!(directives[0].warn_only);
+            }
+            SchemaSource::None => panic!("Expected Directives"),
+        }
+    }
+
+    #[test]
+    fn test_extract_no_directive() {
+        let doc_src = "test";
+        let doc: KdlDocument = doc_src.parse().unwrap();
+        let source = KdlSchemaV2::extract_directives(&doc);
+
+        assert!(matches!(source, SchemaSource::None));
+    }
+
+    #[test]
+    fn test_validate_with_severity_warn_only() {
+        let schema_src = r#"
+document {
+    node "required-node" {
+        required
+    }
+}
+"#;
+        let doc_src = "other-node"; // missing required node
+        let schema = KdlSchemaV2::parse(schema_src).unwrap();
+        let doc: KdlDocument = doc_src.parse().unwrap();
+
+        // Without warn_only, should be error
+        let errors = schema.validate(&doc);
+        assert!(!errors.is_empty());
+        assert_eq!(errors[0].severity, miette::Severity::Error);
+
+        // With warn_only, should be warning
+        let warnings = schema.validate_with_severity(&doc, true);
+        assert!(!warnings.is_empty());
+        assert_eq!(warnings[0].severity, miette::Severity::Warning);
+    }
+
+    #[test]
+    fn test_resolve_absolute_path() {
+        let path = resolve_schema_path("/absolute/path/schema.kdl", Path::new("/some/dir"));
+        assert_eq!(path, PathBuf::from("/absolute/path/schema.kdl"));
+    }
+
+    #[test]
+    fn test_resolve_relative_path() {
+        let path = resolve_schema_path("schemas/test.kdl", Path::new("/project/src"));
+        // Note: canonicalize may fail if path doesn't exist, so we get the joined path
+        assert!(path.ends_with("schemas/test.kdl"));
+        assert!(path.starts_with("/project/src"));
+    }
+
+    #[test]
+    fn test_load_from_path_success() {
+        let temp_dir = std::env::temp_dir();
+        let schema_path = temp_dir.join("test_schema_load.kdl");
+
+        let schema_content = r#"
+document {
+    node "test"
+}
+"#;
+        std::fs::write(&schema_path, schema_content).unwrap();
+
+        let schema = KdlSchemaV2::load_from_path(&schema_path);
+        std::fs::remove_file(&schema_path).ok();
+
+        assert!(schema.is_ok());
+        assert!(schema.unwrap().document_node().is_some());
+    }
+
+    #[test]
+    fn test_load_from_path_not_found() {
+        let path = PathBuf::from("/nonexistent/path/schema.kdl");
+        let result = KdlSchemaV2::load_from_path(&path);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(!err.diagnostics.is_empty());
+        assert!(err.diagnostics[0]
+            .message
+            .as_ref()
+            .unwrap()
+            .contains("Failed to read"));
+    }
+
+    #[test]
+    fn test_load_from_path_invalid_schema() {
+        let temp_dir = std::env::temp_dir();
+        let schema_path = temp_dir.join("test_invalid_schema.kdl");
+
+        // Valid KDL but not a valid schema (missing document node)
+        let invalid_content = "node-without-document";
+        std::fs::write(&schema_path, invalid_content).unwrap();
+
+        let result = KdlSchemaV2::load_from_path(&schema_path);
+        std::fs::remove_file(&schema_path).ok();
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.diagnostics[0]
+            .message
+            .as_ref()
+            .unwrap()
+            .contains("document"));
+    }
+
+    #[test]
+    fn test_validate_with_directives_no_directives() {
+        let doc_src = "some-node";
+        let doc: KdlDocument = doc_src.parse().unwrap();
+
+        let result = validate_with_directives(&doc, Path::new("/some/dir"));
+
+        assert!(result.diagnostics.is_empty());
+        assert!(result.validated_schemas.is_empty());
+        assert!(result.failed_schemas.is_empty());
+    }
+
+    #[test]
+    fn test_validate_with_directives_missing_schema() {
+        let doc_src = r#"
+@ksl:schema "nonexistent.kdl"
+test-node
+"#;
+        let doc: KdlDocument = doc_src.parse().unwrap();
+
+        let result = validate_with_directives(&doc, Path::new("/nonexistent/dir"));
+
+        assert!(!result.diagnostics.is_empty());
+        assert!(result.validated_schemas.is_empty());
+        assert_eq!(result.failed_schemas.len(), 1);
+        assert!(result.diagnostics[0]
+            .message
+            .as_ref()
+            .unwrap()
+            .contains("Failed to load"));
+        assert_eq!(result.diagnostics[0].severity, miette::Severity::Error);
+    }
+
+    #[test]
+    fn test_validate_with_directives_warn_only_missing() {
+        let doc_src = r#"
+@ksl:schema "nonexistent.kdl" warn-only=#true
+test-node
+"#;
+        let doc: KdlDocument = doc_src.parse().unwrap();
+
+        let result = validate_with_directives(&doc, Path::new("/nonexistent/dir"));
+
+        assert!(!result.diagnostics.is_empty());
+        // Should be warning, not error
+        assert_eq!(result.diagnostics[0].severity, miette::Severity::Warning);
+    }
+
+    #[test]
+    fn test_validate_with_directives_success() {
+        let temp_dir = std::env::temp_dir();
+        let schema_path = temp_dir.join("test_validate_directive.kdl");
+
+        let schema_content = r#"
+document {
+    node "test-node"
+}
+"#;
+        std::fs::write(&schema_path, schema_content).unwrap();
+
+        let doc_src = format!(
+            r#"
+@ksl:schema "{}"
+test-node
+"#,
+            schema_path.display()
+        );
+        let doc: KdlDocument = doc_src.parse().unwrap();
+
+        let result = validate_with_directives(&doc, &temp_dir);
+        std::fs::remove_file(&schema_path).ok();
+
+        assert!(
+            result.diagnostics.is_empty(),
+            "Expected no errors, got: {:?}",
+            result.diagnostics
+        );
+        assert_eq!(result.validated_schemas.len(), 1);
+        assert!(result.failed_schemas.is_empty());
+    }
+
+    #[test]
+    fn test_validate_with_directives_validation_error() {
+        let temp_dir = std::env::temp_dir();
+        let schema_path = temp_dir.join("test_validate_error.kdl");
+
+        let schema_content = r#"
+document {
+    node "required-node" {
+        required
+    }
+}
+"#;
+        std::fs::write(&schema_path, schema_content).unwrap();
+
+        let doc_src = format!(
+            r#"
+@ksl:schema "{}"
+other-node
+"#,
+            schema_path.display()
+        );
+        let doc: KdlDocument = doc_src.parse().unwrap();
+
+        let result = validate_with_directives(&doc, &temp_dir);
+        std::fs::remove_file(&schema_path).ok();
+
+        assert!(!result.diagnostics.is_empty());
+        // Schema loaded successfully but validation failed
+        assert_eq!(result.validated_schemas.len(), 1);
+        assert!(result.failed_schemas.is_empty());
+    }
+
+    #[test]
+    fn test_validate_with_directives_multiple_schemas() {
+        let temp_dir = std::env::temp_dir();
+        let schema1_path = temp_dir.join("test_multi_schema1.kdl");
+        let schema2_path = temp_dir.join("test_multi_schema2.kdl");
+
+        let schema1_content = r#"
+document {
+    node "node-a"
+}
+"#;
+        let schema2_content = r#"
+document {
+    node "node-b"
+}
+"#;
+        std::fs::write(&schema1_path, schema1_content).unwrap();
+        std::fs::write(&schema2_path, schema2_content).unwrap();
+
+        let doc_src = format!(
+            r#"
+@ksl:schema "{}"
+@ksl:schema "{}"
+node-a
+node-b
+"#,
+            schema1_path.display(),
+            schema2_path.display()
+        );
+        let doc: KdlDocument = doc_src.parse().unwrap();
+
+        let result = validate_with_directives(&doc, &temp_dir);
+        std::fs::remove_file(&schema1_path).ok();
+        std::fs::remove_file(&schema2_path).ok();
+
+        assert!(
+            result.diagnostics.is_empty(),
+            "Expected no errors, got: {:?}",
+            result.diagnostics
+        );
+        assert_eq!(result.validated_schemas.len(), 2);
+        assert!(result.failed_schemas.is_empty());
     }
 }

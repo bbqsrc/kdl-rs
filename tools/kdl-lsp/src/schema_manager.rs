@@ -1,6 +1,8 @@
 //! Schema management for KDL LSP.
 //!
 //! Handles schema caching, resolution, and document-to-schema associations.
+//! Uses core schema_v2 types for directive extraction, adds LSP-specific
+//! path resolution and config file support.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -9,7 +11,7 @@ use std::time::SystemTime;
 
 use dashmap::DashMap;
 use globset::{Glob, GlobMatcher};
-use kdl::schema_v2::KdlSchemaV2;
+use kdl::schema_v2::{resolve_schema_path, KdlSchemaV2};
 use kdl::KdlDocument;
 use miette::SourceSpan;
 
@@ -24,23 +26,25 @@ pub struct CachedSchema {
     pub modified: SystemTime,
 }
 
-/// A single schema directive with its path and span.
+/// A resolved schema directive with absolute path.
+/// Created by resolving paths from core's SchemaDirective.
 #[derive(Debug, Clone)]
-pub struct SchemaDirective {
+pub struct ResolvedDirective {
     /// Resolved absolute path to schema file
     pub path: PathBuf,
     /// Span of the directive in the document (for error reporting)
-    pub directive_span: SourceSpan,
+    pub span: SourceSpan,
     /// Whether validation failures should only produce warnings
     pub warn_only: bool,
 }
 
 /// Represents how a schema was resolved for a document.
+/// Extends core's SchemaSource with LSP-specific ConfigFile variant.
 #[derive(Debug, Clone)]
 pub enum SchemaSource {
     /// From @ksl:schema directive(s) in the document
     /// Per spec: ALL schemas must validate for the document to pass
-    Directives(Vec<SchemaDirective>),
+    Directives(Vec<ResolvedDirective>),
     /// From .kdl-config.kdl glob mapping
     ConfigFile {
         /// Resolved absolute path to schema file
@@ -103,75 +107,38 @@ impl SchemaManager {
     }
 
     /// Extract @ksl:schema directive(s) from an already-parsed document.
+    /// Uses core's extract_directives() and resolve_schema_path().
     /// Per spec: ALL schemas must validate for the document to pass.
     fn extract_directive_from_parsed(
         &self,
         uri: &str,
         doc: &KdlDocument,
-        workspace_roots: &[PathBuf],
-    ) -> Option<SchemaSource> {
-        // Resolve document directory for relative path resolution
-        let document_path = url::Url::parse(uri)
-            .ok()
-            .and_then(|u| u.to_file_path().ok())?;
-        let document_dir = document_path.parent()?;
-
-        let mut directives = Vec::new();
-
-        // Collect ALL @ksl:schema nodes (there can be multiple)
-        for node in doc.nodes() {
-            if node.name().value() == "@ksl:schema" {
-                let directive_span = node.span();
-
-                // Check for warn-only property
-                let warn_only = node
-                    .entry("warn-only")
-                    .and_then(|e| e.value().as_bool())
-                    .unwrap_or(false);
-
-                // Collect ALL arguments (each is a schema path)
-                for entry in node.entries() {
-                    if entry.name().is_none() {
-                        // This is a positional argument (schema path)
-                        if let Some(schema_path_str) = entry.value().as_string() {
-                            let resolved_path = self.resolve_schema_path(
-                                schema_path_str,
-                                document_dir,
-                                workspace_roots,
-                            );
-                            directives.push(SchemaDirective {
-                                path: resolved_path,
-                                directive_span,
-                                warn_only,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        if directives.is_empty() {
-            None
-        } else {
-            Some(SchemaSource::Directives(directives))
-        }
-    }
-
-    /// Resolve a schema path that may be relative or absolute.
-    fn resolve_schema_path(
-        &self,
-        schema_path: &str,
-        document_dir: &Path,
         _workspace_roots: &[PathBuf],
-    ) -> PathBuf {
-        let path = Path::new(schema_path);
+    ) -> Option<SchemaSource> {
+        // Use core to extract directives
+        let core_source = KdlSchemaV2::extract_directives(doc);
 
-        if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            // Relative to the document's directory
-            let resolved = document_dir.join(path);
-            resolved.canonicalize().unwrap_or(resolved)
+        match core_source {
+            kdl::schema_v2::SchemaSource::Directives(core_directives) => {
+                // Resolve document directory for relative path resolution
+                let document_path = url::Url::parse(uri)
+                    .ok()
+                    .and_then(|u| u.to_file_path().ok())?;
+                let document_dir = document_path.parent()?;
+
+                // Resolve paths using core's utility
+                let resolved: Vec<ResolvedDirective> = core_directives
+                    .into_iter()
+                    .map(|d| ResolvedDirective {
+                        path: resolve_schema_path(&d.path, document_dir),
+                        span: d.span,
+                        warn_only: d.warn_only,
+                    })
+                    .collect();
+
+                Some(SchemaSource::Directives(resolved))
+            }
+            kdl::schema_v2::SchemaSource::None => None,
         }
     }
 
@@ -389,7 +356,7 @@ impl SchemaManager {
 /// Extract the first schema path from a SchemaSource (for reverse mapping).
 fn schema_source_path(source: &SchemaSource) -> Option<PathBuf> {
     match source {
-        SchemaSource::Directives(directives) => directives.first().map(|d| d.path.clone()),
+        SchemaSource::Directives(resolved) => resolved.first().map(|d| d.path.clone()),
         SchemaSource::ConfigFile { path, .. } => Some(path.clone()),
         SchemaSource::None => None,
     }

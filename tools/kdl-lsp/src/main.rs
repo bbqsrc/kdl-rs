@@ -45,11 +45,9 @@ impl Backend {
                 for directive in directives {
                     match self.schema_manager.get_or_load_schema(&directive.path) {
                         Ok(schema) => {
-                            let kdl_diags = schema.validate(doc);
-                            // Convert severity based on warn_only flag
-                            let converted =
-                                self.convert_kdl_diagnostics(&kdl_diags, rope, directive.warn_only);
-                            diagnostics.extend(converted);
+                            // Use core's validate_with_severity for warn_only handling
+                            let kdl_diags = schema.validate_with_severity(doc, directive.warn_only);
+                            diagnostics.extend(self.convert_kdl_diagnostics(&kdl_diags, rope));
                         }
                         Err(err) => {
                             // Show error at the @ksl:schema directive location
@@ -60,10 +58,9 @@ impl Backend {
                             };
                             diagnostics.push(Diagnostic::new(
                                 Range::new(
-                                    char_to_position(directive.directive_span.offset(), rope),
+                                    char_to_position(directive.span.offset(), rope),
                                     char_to_position(
-                                        directive.directive_span.offset()
-                                            + directive.directive_span.len(),
+                                        directive.span.offset() + directive.span.len(),
                                         rope,
                                     ),
                                 ),
@@ -82,7 +79,7 @@ impl Backend {
                 match self.schema_manager.get_or_load_schema(path) {
                     Ok(schema) => {
                         let kdl_diags = schema.validate(doc);
-                        diagnostics.extend(self.convert_kdl_diagnostics(&kdl_diags, rope, false));
+                        diagnostics.extend(self.convert_kdl_diagnostics(&kdl_diags, rope));
                     }
                     Err(err) => {
                         // Config-based schema errors show at document start
@@ -106,31 +103,16 @@ impl Backend {
     }
 
     /// Convert KdlDiagnostic to LSP Diagnostic.
-    /// If `warn_only` is true, errors are downgraded to warnings.
-    fn convert_kdl_diagnostics(
-        &self,
-        kdl_diags: &[KdlDiagnostic],
-        rope: &Rope,
-        warn_only: bool,
-    ) -> Vec<Diagnostic> {
+    fn convert_kdl_diagnostics(&self, kdl_diags: &[KdlDiagnostic], rope: &Rope) -> Vec<Diagnostic> {
         kdl_diags
             .iter()
             .map(|diag| {
-                let severity = if warn_only {
-                    // Downgrade errors to warnings when warn_only is set
-                    match diag.severity {
-                        miette::Severity::Error => DiagnosticSeverity::WARNING,
-                        other => to_lsp_sev(other),
-                    }
-                } else {
-                    to_lsp_sev(diag.severity)
-                };
                 Diagnostic::new(
                     Range::new(
                         char_to_position(diag.span.offset(), rope),
                         char_to_position(diag.span.offset() + diag.span.len(), rope),
                     ),
-                    Some(severity),
+                    Some(to_lsp_sev(diag.severity)),
                     Some(NumberOrString::String("kdl-schema".into())),
                     Some("kdl-schema-v2".into()),
                     diag.message
