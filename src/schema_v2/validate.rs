@@ -31,11 +31,29 @@ pub(super) fn validate_document(schema: &KdlSchemaV2, target: &KdlDocument) -> V
         validate_children_block(schema, target, children_block, &target_input, &mut errors);
     } else {
         // If no explicit children block, treat document children as node definitions directly
-        let node_defs: Vec<&KdlNode> = schema_children
+        let mut node_defs: Vec<&KdlNode> = schema_children
             .nodes()
             .iter()
             .filter(|n| n.name().value() == "node")
             .collect();
+
+        // Process undefine blocks
+        for undef in schema_children
+            .nodes()
+            .iter()
+            .filter(|n| n.name().value() == "undefine")
+        {
+            if let Some(undef_children) = undef.children() {
+                for undef_node in undef_children
+                    .nodes()
+                    .iter()
+                    .filter(|n| n.name().value() == "node")
+                {
+                    let name_to_remove = undef_node.get(0).and_then(|v| v.as_string());
+                    node_defs.retain(|d| d.get(0).and_then(|v| v.as_string()) != name_to_remove);
+                }
+            }
+        }
 
         let disallow_others = schema_children
             .get("disallow-others")
@@ -75,11 +93,29 @@ fn validate_children_block(
     };
 
     // Collect node definitions
-    let node_defs: Vec<&KdlNode> = block_children
+    let mut node_defs: Vec<&KdlNode> = block_children
         .nodes()
         .iter()
         .filter(|n| n.name().value() == "node")
         .collect();
+
+    // Process undefine blocks - remove any node definitions that are undefined
+    for undef in block_children
+        .nodes()
+        .iter()
+        .filter(|n| n.name().value() == "undefine")
+    {
+        if let Some(undef_children) = undef.children() {
+            for undef_node in undef_children
+                .nodes()
+                .iter()
+                .filter(|n| n.name().value() == "node")
+            {
+                let name_to_remove = undef_node.get(0).and_then(|v| v.as_string());
+                node_defs.retain(|d| d.get(0).and_then(|v| v.as_string()) != name_to_remove);
+            }
+        }
+    }
 
     // Check disallow-others (v2: default is false, meaning others are allowed)
     // If node exists without a value, it defaults to true
@@ -175,7 +211,7 @@ fn validate_children_block(
     check_node_cardinality(target, &node_defs, input, errors);
 }
 
-/// Resolve a `ref` property by looking up the definition by id or path.
+/// Resolve a `ref` property by looking up the definition by id or KQL path.
 fn resolve_ref<'a>(schema: &'a KdlSchemaV2, node: &KdlNode) -> Option<&'a KdlNode> {
     // Check for ref child node (v2 uses ref as a child, not property)
     let ref_child = node.children()?.get("ref")?;
@@ -183,10 +219,18 @@ fn resolve_ref<'a>(schema: &'a KdlSchemaV2, node: &KdlNode) -> Option<&'a KdlNod
     // Get the path from the ref's first argument
     let ref_path = ref_child.get(0)?.as_string()?;
 
-    // Look up in definitions
-    schema
-        .definitions()?
-        .children()?
+    let definitions = schema.definitions()?;
+    let def_children = definitions.children()?;
+
+    // Try KQL path resolution first
+    if let Ok(query) = ref_path.parse::<crate::query::KdlQuery>() {
+        if let Ok(Some(result)) = def_children.query(query) {
+            return Some(result);
+        }
+    }
+
+    // Fallback: id-based lookup (existing behavior)
+    def_children
         .nodes()
         .iter()
         .find(|n| n.entry("id").and_then(|e| e.value().as_string()) == Some(ref_path))
@@ -239,6 +283,9 @@ fn validate_node(
             // Check for deprecated node
             check_deprecated(node, def, input, errors);
 
+            // Validate node's type annotation if schema specifies one
+            validate_node_annotation(schema, node, def, input, errors);
+
             // Validate node's entries (args and props)
             validate_node_entries(schema, node, def, input, errors);
 
@@ -261,6 +308,53 @@ fn validate_node(
             });
         }
         None => {}
+    }
+}
+
+/// Validate a node's type annotation against schema constraints.
+fn validate_node_annotation(
+    schema: &KdlSchemaV2,
+    node: &KdlNode,
+    schema_def: &KdlNode,
+    input: &Arc<String>,
+    errors: &mut Vec<KdlDiagnostic>,
+) {
+    let Some(def_children) = schema_def.children() else {
+        return;
+    };
+
+    // Check for annotations node in schema
+    let annotations_node = def_children.get("annotations");
+
+    if let Some(ann_node) = annotations_node {
+        let annotations_validations = build_validations(schema, ann_node);
+
+        // Get node's type annotation (the (type) prefix)
+        if let Some(node_ty) = node.ty() {
+            let ty_value = KdlValue::String(node_ty.value().to_string());
+            #[cfg(feature = "span")]
+            let span = node_ty.span();
+            #[cfg(not(feature = "span"))]
+            let span = SourceSpan::new(0.into(), 0);
+            errors.extend(annotations_validations.check(&ty_value, span, input));
+        } else if annotations_validations.ty.is_some()
+            || !annotations_validations.enum_values.is_empty()
+        {
+            // Annotation required but missing (schema specifies type or enum)
+            #[cfg(feature = "span")]
+            let span = node.span();
+            #[cfg(not(feature = "span"))]
+            let span = SourceSpan::new(0.into(), 0);
+
+            errors.push(KdlDiagnostic {
+                input: input.clone(),
+                span,
+                message: Some("Missing required type annotation".into()),
+                label: Some("type annotation expected".into()),
+                help: Some("Add a type annotation like (type)nodename".into()),
+                severity: Severity::Error,
+            });
+        }
     }
 }
 
@@ -316,25 +410,57 @@ fn validate_node_entries(
         return;
     };
 
-    // Collect arg definitions (ordered)
-    let arg_defs: Vec<&KdlNode> = def_children
+    // Resolve ref to get inherited definitions
+    let ref_node = resolve_ref(schema, schema_def);
+    let ref_children = ref_node.and_then(|n| n.children());
+
+    // Collect arg definitions (ordered) - from both current def and ref
+    let mut arg_defs: Vec<&KdlNode> = def_children
         .nodes()
         .iter()
         .filter(|n| n.name().value() == "arg")
         .collect();
 
-    // Get args definition (for variadic args)
-    let args_def = def_children.get("args");
+    // Add arg defs from referenced definition if present
+    if let Some(rc) = ref_children {
+        for arg_node in rc.nodes().iter().filter(|n| n.name().value() == "arg") {
+            // Only add if we don't already have one at this position
+            if !arg_defs.iter().any(|_| false) {
+                // For now, just append ref args to the list
+                arg_defs.push(arg_node);
+            }
+        }
+    }
 
-    // Collect prop definitions
-    let prop_defs: Vec<&KdlNode> = def_children
+    // Get args definition (for variadic args) - prefer local, fallback to ref
+    let args_def = def_children
+        .get("args")
+        .or_else(|| ref_children.and_then(|rc| rc.get("args")));
+
+    // Collect prop definitions - from both current def and ref
+    let mut prop_defs: Vec<&KdlNode> = def_children
         .nodes()
         .iter()
         .filter(|n| n.name().value() == "prop")
         .collect();
 
-    // Get props aggregate (for general property validations)
-    let props_def = def_children.get("props");
+    // Add prop defs from referenced definition if present
+    if let Some(rc) = ref_children {
+        for prop_node in rc.nodes().iter().filter(|n| n.name().value() == "prop") {
+            let ref_prop_name = prop_node.get(0).and_then(|v| v.as_string());
+            // Only add if we don't already have a prop with the same name
+            if !prop_defs.iter().any(|p| {
+                p.get(0).and_then(|v| v.as_string()) == ref_prop_name && ref_prop_name.is_some()
+            }) {
+                prop_defs.push(prop_node);
+            }
+        }
+    }
+
+    // Get props aggregate (for general property validations) - prefer local, fallback to ref
+    let props_def = def_children
+        .get("props")
+        .or_else(|| ref_children.and_then(|rc| rc.get("props")));
 
     // Check if other props are disallowed
     let disallow_other_props = props_def
@@ -442,7 +568,12 @@ fn validate_node_entries(
                 .is_some_and(|n| n.get(0).and_then(|v| v.as_bool()).unwrap_or(true))
         });
 
-        if !is_optional && idx >= arg_idx {
+        // Check if arg has a default value - if so, it's not required
+        let has_default = arg_def
+            .children()
+            .is_some_and(|c| c.get("default").is_some());
+
+        if !is_optional && !has_default && idx >= arg_idx {
             #[cfg(feature = "span")]
             let span = node.span();
             #[cfg(not(feature = "span"))]
@@ -533,7 +664,12 @@ fn validate_node_entries(
                 .is_some_and(|n| n.get(0).and_then(|v| v.as_bool()).unwrap_or(true))
         });
 
-        if is_required {
+        // Check if prop has a default value - if so, it's not required
+        let has_default = prop_def
+            .children()
+            .is_some_and(|c| c.get("default").is_some());
+
+        if is_required && !has_default {
             if let Some(name) = prop_name {
                 if !found_props.contains_key(name) {
                     #[cfg(feature = "span")]

@@ -895,4 +895,286 @@ document {
         assert!(!errors.is_empty());
         assert!(errors[0].message.as_ref().unwrap().contains("port"));
     }
+
+    // Tests for new features: ref with KQL, annotations, default, undefine
+
+    #[test]
+    fn test_ref_with_id_lookup() {
+        let schema_src = r#"
+definitions {
+    node "base-type" id="string-arg" {
+        arg { type string }
+    }
+}
+document {
+    node "derived" {
+        ref "string-arg"
+    }
+}
+"#;
+        let schema = KdlSchemaV2::parse(schema_src).unwrap();
+
+        // Valid - has string arg as defined in referenced definition
+        let doc_valid: KdlDocument = r#"derived "hello""#.parse().unwrap();
+        let errors = schema.validate(&doc_valid);
+        assert!(errors.is_empty(), "Expected no errors, got: {:?}", errors);
+
+        // Invalid - has number arg instead of string
+        let doc_invalid: KdlDocument = "derived 42".parse().unwrap();
+        let errors = schema.validate(&doc_invalid);
+        assert!(!errors.is_empty(), "Expected type error for number arg");
+    }
+
+    #[test]
+    fn test_ref_with_kql_path() {
+        let schema_src = r#"
+definitions {
+    node "base-type" id="base" {
+        arg { type string }
+    }
+}
+document {
+    node "derived" {
+        ref "node[id=\"base\"]"
+    }
+}
+"#;
+        let schema = KdlSchemaV2::parse(schema_src).unwrap();
+
+        // Valid - has string arg as required by ref
+        let doc_valid: KdlDocument = r#"derived "hello""#.parse().unwrap();
+        let errors = schema.validate(&doc_valid);
+        assert!(errors.is_empty(), "Expected no errors, got: {:?}", errors);
+
+        // Invalid - missing required arg (inherited from ref)
+        let doc_invalid: KdlDocument = "derived".parse().unwrap();
+        let errors = schema.validate(&doc_invalid);
+        assert!(
+            !errors.is_empty(),
+            "Expected error for missing required arg"
+        );
+    }
+
+    #[test]
+    fn test_undefine_node() {
+        let schema_src = r#"
+document {
+    children {
+        node "allowed"
+        undefine {
+            node "forbidden"
+        }
+        disallow-others
+    }
+}
+"#;
+        let schema = KdlSchemaV2::parse(schema_src).unwrap();
+
+        // Valid - "allowed" is defined
+        let doc_valid: KdlDocument = "allowed".parse().unwrap();
+        let errors = schema.validate(&doc_valid);
+        assert!(errors.is_empty(), "Expected no errors, got: {:?}", errors);
+
+        // Invalid - "forbidden" is explicitly undefined
+        let doc_invalid: KdlDocument = "forbidden".parse().unwrap();
+        let errors = schema.validate(&doc_invalid);
+        assert!(
+            !errors.is_empty(),
+            "Expected error for undefined node 'forbidden'"
+        );
+    }
+
+    #[test]
+    fn test_undefine_removes_from_validation() {
+        // This tests that undefine actually removes a node definition
+        // even if the node was previously defined
+        let schema_src = r#"
+document {
+    children {
+        node "keep-this"
+        node "remove-this"
+        undefine {
+            node "remove-this"
+        }
+        disallow-others
+    }
+}
+"#;
+        let schema = KdlSchemaV2::parse(schema_src).unwrap();
+
+        // "remove-this" should be rejected because it was undefined
+        let doc: KdlDocument = "remove-this".parse().unwrap();
+        let errors = schema.validate(&doc);
+        assert!(
+            !errors.is_empty(),
+            "Expected error - 'remove-this' was undefined"
+        );
+
+        // "keep-this" should work fine
+        let doc: KdlDocument = "keep-this".parse().unwrap();
+        let errors = schema.validate(&doc);
+        assert!(errors.is_empty(), "Expected no errors, got: {:?}", errors);
+    }
+
+    #[test]
+    fn test_annotations_enum() {
+        let schema_src = r#"
+document {
+    node "value" {
+        annotations {
+            enum "string" "number" "bool"
+        }
+    }
+}
+"#;
+        let schema = KdlSchemaV2::parse(schema_src).unwrap();
+
+        // Valid - type annotation is in enum
+        let doc_valid: KdlDocument = "(string)value".parse().unwrap();
+        let errors = schema.validate(&doc_valid);
+        assert!(errors.is_empty(), "Expected no errors, got: {:?}", errors);
+
+        // Invalid - type annotation not in enum
+        let doc_invalid: KdlDocument = "(unknown)value".parse().unwrap();
+        let errors = schema.validate(&doc_invalid);
+        assert!(!errors.is_empty(), "Expected error for invalid annotation");
+    }
+
+    #[test]
+    fn test_annotations_pattern() {
+        let schema_src = r#"
+document {
+    node "typed" {
+        annotations {
+            pattern "^(i|u)(8|16|32|64)$"
+        }
+    }
+}
+"#;
+        let schema = KdlSchemaV2::parse(schema_src).unwrap();
+
+        // Valid - matches pattern
+        let doc_valid: KdlDocument = "(i32)typed".parse().unwrap();
+        let errors = schema.validate(&doc_valid);
+        assert!(errors.is_empty(), "Expected no errors, got: {:?}", errors);
+
+        // Invalid - doesn't match pattern
+        let doc_invalid: KdlDocument = "(float)typed".parse().unwrap();
+        let errors = schema.validate(&doc_invalid);
+        assert!(
+            !errors.is_empty(),
+            "Expected error for annotation not matching pattern"
+        );
+    }
+
+    #[test]
+    fn test_annotations_missing_error() {
+        let schema_src = r#"
+document {
+    node "must-have-type" {
+        annotations {
+            enum "a" "b"
+        }
+    }
+}
+"#;
+        let schema = KdlSchemaV2::parse(schema_src).unwrap();
+
+        // Invalid - missing required type annotation
+        let doc: KdlDocument = "must-have-type".parse().unwrap();
+        let errors = schema.validate(&doc);
+        assert!(
+            !errors.is_empty(),
+            "Expected error for missing type annotation"
+        );
+        assert!(
+            errors[0]
+                .message
+                .as_ref()
+                .unwrap()
+                .contains("type annotation"),
+            "Error should mention type annotation"
+        );
+    }
+
+    #[test]
+    fn test_default_arg_no_error() {
+        let schema_src = r#"
+document {
+    node "config" {
+        arg {
+            type number
+            default 42
+        }
+    }
+}
+"#;
+        let schema = KdlSchemaV2::parse(schema_src).unwrap();
+
+        // Valid - missing arg but has default, so no error
+        let doc: KdlDocument = "config".parse().unwrap();
+        let errors = schema.validate(&doc);
+        assert!(
+            errors.is_empty(),
+            "Expected no error - arg has default. Got: {:?}",
+            errors
+        );
+
+        // Also valid - providing the arg explicitly
+        let doc: KdlDocument = "config 100".parse().unwrap();
+        let errors = schema.validate(&doc);
+        assert!(errors.is_empty(), "Expected no errors, got: {:?}", errors);
+    }
+
+    #[test]
+    fn test_default_prop_no_error() {
+        let schema_src = r#"
+document {
+    node "settings" {
+        prop "timeout" {
+            required
+            type number
+            default 30
+        }
+    }
+}
+"#;
+        let schema = KdlSchemaV2::parse(schema_src).unwrap();
+
+        // Valid - missing required prop but has default, so no error
+        let doc: KdlDocument = "settings".parse().unwrap();
+        let errors = schema.validate(&doc);
+        assert!(
+            errors.is_empty(),
+            "Expected no error - prop has default. Got: {:?}",
+            errors
+        );
+
+        // Also valid - providing the prop explicitly
+        let doc: KdlDocument = "settings timeout=60".parse().unwrap();
+        let errors = schema.validate(&doc);
+        assert!(errors.is_empty(), "Expected no errors, got: {:?}", errors);
+    }
+
+    #[test]
+    fn test_default_without_default_still_errors() {
+        // Sanity check: args without default should still error when missing
+        let schema_src = r#"
+document {
+    node "required-arg" {
+        arg {
+            type number
+        }
+    }
+}
+"#;
+        let schema = KdlSchemaV2::parse(schema_src).unwrap();
+
+        let doc: KdlDocument = "required-arg".parse().unwrap();
+        let errors = schema.validate(&doc);
+        assert!(
+            !errors.is_empty(),
+            "Expected error - arg is required and has no default"
+        );
+    }
 }
