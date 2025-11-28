@@ -24,16 +24,23 @@ pub struct CachedSchema {
     pub modified: SystemTime,
 }
 
+/// A single schema directive with its path and span.
+#[derive(Debug, Clone)]
+pub struct SchemaDirective {
+    /// Resolved absolute path to schema file
+    pub path: PathBuf,
+    /// Span of the directive in the document (for error reporting)
+    pub directive_span: SourceSpan,
+    /// Whether validation failures should only produce warnings
+    pub warn_only: bool,
+}
+
 /// Represents how a schema was resolved for a document.
 #[derive(Debug, Clone)]
 pub enum SchemaSource {
-    /// From @ksl:schema directive in the document
-    Directive {
-        /// Resolved absolute path to schema file
-        path: PathBuf,
-        /// Span of the directive in the document (for error reporting)
-        directive_span: SourceSpan,
-    },
+    /// From @ksl:schema directive(s) in the document
+    /// Per spec: ALL schemas must validate for the document to pass
+    Directives(Vec<SchemaDirective>),
     /// From .kdl-config.kdl glob mapping
     ConfigFile {
         /// Resolved absolute path to schema file
@@ -95,32 +102,59 @@ impl SchemaManager {
         SchemaSource::None
     }
 
-    /// Extract @ksl:schema directive from an already-parsed document.
+    /// Extract @ksl:schema directive(s) from an already-parsed document.
+    /// Per spec: ALL schemas must validate for the document to pass.
     fn extract_directive_from_parsed(
         &self,
         uri: &str,
         doc: &KdlDocument,
         workspace_roots: &[PathBuf],
     ) -> Option<SchemaSource> {
-        let directive = doc.get("@ksl:schema")?;
-        let schema_path_str = directive.get(0)?.as_string()?;
-
-        // Get directive span for error reporting
-        let directive_span = directive.span();
-
-        // Resolve path (relative to document or absolute)
+        // Resolve document directory for relative path resolution
         let document_path = url::Url::parse(uri)
             .ok()
             .and_then(|u| u.to_file_path().ok())?;
         let document_dir = document_path.parent()?;
 
-        let resolved_path =
-            self.resolve_schema_path(schema_path_str, document_dir, workspace_roots);
+        let mut directives = Vec::new();
 
-        Some(SchemaSource::Directive {
-            path: resolved_path,
-            directive_span,
-        })
+        // Collect ALL @ksl:schema nodes (there can be multiple)
+        for node in doc.nodes() {
+            if node.name().value() == "@ksl:schema" {
+                let directive_span = node.span();
+
+                // Check for warn-only property
+                let warn_only = node
+                    .entry("warn-only")
+                    .and_then(|e| e.value().as_bool())
+                    .unwrap_or(false);
+
+                // Collect ALL arguments (each is a schema path)
+                for entry in node.entries() {
+                    if entry.name().is_none() {
+                        // This is a positional argument (schema path)
+                        if let Some(schema_path_str) = entry.value().as_string() {
+                            let resolved_path = self.resolve_schema_path(
+                                schema_path_str,
+                                document_dir,
+                                workspace_roots,
+                            );
+                            directives.push(SchemaDirective {
+                                path: resolved_path,
+                                directive_span,
+                                warn_only,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        if directives.is_empty() {
+            None
+        } else {
+            Some(SchemaSource::Directives(directives))
+        }
     }
 
     /// Resolve a schema path that may be relative or absolute.
@@ -352,10 +386,10 @@ impl SchemaManager {
     }
 }
 
-/// Extract the schema path from a SchemaSource.
+/// Extract the first schema path from a SchemaSource (for reverse mapping).
 fn schema_source_path(source: &SchemaSource) -> Option<PathBuf> {
     match source {
-        SchemaSource::Directive { path, .. } => Some(path.clone()),
+        SchemaSource::Directives(directives) => directives.first().map(|d| d.path.clone()),
         SchemaSource::ConfigFile { path, .. } => Some(path.clone()),
         SchemaSource::None => None,
     }

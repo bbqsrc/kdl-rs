@@ -9,8 +9,44 @@ use regex::Regex;
 
 use crate::{KdlDiagnostic, KdlNode, KdlValue};
 
+/// Extract the `about` description from a schema node.
+///
+/// Per the spec, `about` can be either:
+/// - A property: `node "foo" about="description"`
+/// - A child node: `node "foo" { about "description" }` (takes precedence)
+pub(super) fn extract_about(node: &KdlNode) -> Option<String> {
+    // Child node takes precedence (MUST per spec)
+    if let Some(children) = node.children() {
+        if let Some(about_node) = children.get("about") {
+            if let Some(text) = about_node.get(0).and_then(|v| v.as_string()) {
+                return Some(text.to_string());
+            }
+        }
+    }
+    // Fall back to property
+    node.entry("about")
+        .and_then(|e| e.value().as_string())
+        .map(|s| s.to_string())
+}
+
+/// Format an error message with an optional `about` description appended.
+pub(super) fn format_message_with_about(base_msg: &str, about: Option<&str>) -> String {
+    match about {
+        Some(desc) => format!("{}\n\n{}", base_msg, desc),
+        None => base_msg.to_string(),
+    }
+}
+
 use jiff::civil::{Date, Time};
 use jiff::Span;
+
+/// The type category a value belongs to for format checking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ValueType {
+    String,
+    Integer,
+    Number,
+}
 
 /// Format constraints for values as defined in the KDL Schema spec.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,6 +142,66 @@ pub enum ValueFormat {
 }
 
 impl ValueFormat {
+    /// Check if this format is applicable to a given value type.
+    ///
+    /// Per the spec, format validation MUST be skipped if the value type
+    /// is not applicable to the format.
+    pub(super) fn is_applicable_to(&self, value_type: ValueType) -> bool {
+        match self {
+            // String formats
+            ValueFormat::DateTime
+            | ValueFormat::Time
+            | ValueFormat::Date
+            | ValueFormat::Duration
+            | ValueFormat::Decimal
+            | ValueFormat::Currency
+            | ValueFormat::Country2
+            | ValueFormat::Country3
+            | ValueFormat::CountrySubdivision
+            | ValueFormat::Email
+            | ValueFormat::IdnEmail
+            | ValueFormat::Hostname
+            | ValueFormat::IdnHostname
+            | ValueFormat::Ipv4
+            | ValueFormat::Ipv6
+            | ValueFormat::Url
+            | ValueFormat::UrlReference
+            | ValueFormat::Irl
+            | ValueFormat::IrlReference
+            | ValueFormat::UrlTemplate
+            | ValueFormat::Uuid
+            | ValueFormat::Regex
+            | ValueFormat::Base64
+            | ValueFormat::KdlQuery
+            | ValueFormat::KPath => value_type == ValueType::String,
+
+            // Integer formats
+            ValueFormat::I8
+            | ValueFormat::I16
+            | ValueFormat::I32
+            | ValueFormat::I64
+            | ValueFormat::I128
+            | ValueFormat::U8
+            | ValueFormat::U16
+            | ValueFormat::U32
+            | ValueFormat::U64
+            | ValueFormat::U128
+            | ValueFormat::Isize
+            | ValueFormat::Usize => value_type == ValueType::Integer,
+
+            // Float/number formats
+            ValueFormat::F32
+            | ValueFormat::F64
+            | ValueFormat::Decimal64
+            | ValueFormat::Decimal128 => {
+                value_type == ValueType::Number || value_type == ValueType::Integer
+            }
+
+            // Custom formats - unknown, so allow any type
+            ValueFormat::Custom(_) => true,
+        }
+    }
+
     /// Parse a format string into a ValueFormat.
     pub fn parse(s: &str) -> Self {
         match s {
@@ -477,10 +573,16 @@ impl Validations {
                 }
             }
 
-            // Format checks - in v2, multiple formats means ANY must match (OR)
-            if !self.formats.is_empty() {
-                let any_format_matches = self
-                    .formats
+            // Format checks - filter to only string-applicable formats
+            // Per spec: MUST skip formats not applicable to value type
+            let applicable_formats: Vec<_> = self
+                .formats
+                .iter()
+                .filter(|f| f.is_applicable_to(ValueType::String))
+                .collect();
+
+            if !applicable_formats.is_empty() {
+                let any_format_matches = applicable_formats
                     .iter()
                     .any(|format| self.check_string_format(s, format));
                 if !any_format_matches {
@@ -489,7 +591,7 @@ impl Validations {
                         span,
                         message: Some(format!(
                             "Value does not match any of formats: {:?}",
-                            self.formats
+                            applicable_formats
                         )),
                         label: Some("format mismatch".into()),
                         help: None,
@@ -577,11 +679,16 @@ impl Validations {
                 }
             }
 
-            // Numeric format checks
+            // Integer format checks - filter to only integer-applicable formats
             if let KdlValue::Integer(i) = value {
-                if !self.formats.is_empty() {
-                    let any_format_matches = self
-                        .formats
+                let applicable_formats: Vec<_> = self
+                    .formats
+                    .iter()
+                    .filter(|f| f.is_applicable_to(ValueType::Integer))
+                    .collect();
+
+                if !applicable_formats.is_empty() {
+                    let any_format_matches = applicable_formats
                         .iter()
                         .any(|format| self.check_integer_format(*i, format));
                     if !any_format_matches {
@@ -590,7 +697,7 @@ impl Validations {
                             span,
                             message: Some(format!(
                                 "Integer does not fit any of formats: {:?}",
-                                self.formats
+                                applicable_formats
                             )),
                             label: Some("format mismatch".into()),
                             help: None,
@@ -600,11 +707,16 @@ impl Validations {
                 }
             }
 
-            // Float format checks
+            // Float format checks - filter to only float-applicable formats
             if let KdlValue::Float(f) = value {
-                if !self.formats.is_empty() {
-                    let any_format_matches = self
-                        .formats
+                let applicable_formats: Vec<_> = self
+                    .formats
+                    .iter()
+                    .filter(|f| f.is_applicable_to(ValueType::Number))
+                    .collect();
+
+                if !applicable_formats.is_empty() {
+                    let any_format_matches = applicable_formats
                         .iter()
                         .any(|format| self.check_float_format(*f, format));
                     if !any_format_matches {
@@ -613,7 +725,7 @@ impl Validations {
                             span,
                             message: Some(format!(
                                 "Float does not fit any of formats: {:?}",
-                                self.formats
+                                applicable_formats
                             )),
                             label: Some("format mismatch".into()),
                             help: None,

@@ -7,7 +7,7 @@ use miette::Severity;
 #[cfg(not(feature = "span"))]
 use miette::SourceSpan;
 
-use super::types::Validations;
+use super::types::{extract_about, format_message_with_about, Validations};
 use super::KdlSchemaV2;
 use crate::{KdlDiagnostic, KdlDocument, KdlNode, KdlValue};
 
@@ -301,7 +301,10 @@ fn validate_node(
             errors.push(KdlDiagnostic {
                 input: input.clone(),
                 span,
-                message: Some(format!("Unknown node: '{}'", node_name)),
+                message: Some(format!(
+                    "Unknown node: '{}'. Only explicitly defined nodes are allowed here.",
+                    node_name
+                )),
                 label: Some("not defined in schema".into()),
                 help: Some("Add this node to the schema or remove 'disallow-others'".into()),
                 severity: Severity::Error,
@@ -523,10 +526,16 @@ fn validate_node_entries(
                     #[cfg(not(feature = "span"))]
                     let span = SourceSpan::new(0.into(), 0);
 
+                    // Get about from parent props definition if available
+                    let about = props_def.and_then(extract_about);
+
                     errors.push(KdlDiagnostic {
                         input: input.clone(),
                         span,
-                        message: Some(format!("Unknown property: '{}'", prop_name)),
+                        message: Some(format_message_with_about(
+                            &format!("Unknown property: '{}'", prop_name),
+                            about.as_deref(),
+                        )),
                         label: Some("not defined in schema".into()),
                         help: Some(
                             "Add this property to the schema or allow other properties".into(),
@@ -579,10 +588,13 @@ fn validate_node_entries(
             #[cfg(not(feature = "span"))]
             let span = SourceSpan::new(0.into(), 0);
 
+            let about = extract_about(arg_def);
+            let base_msg = format!("Missing required argument at position {}", idx + 1);
+
             errors.push(KdlDiagnostic {
                 input: input.clone(),
                 span,
-                message: Some(format!("Missing required argument at position {}", idx + 1)),
+                message: Some(format_message_with_about(&base_msg, about.as_deref())),
                 label: Some("missing argument".into()),
                 help: Some("Add the required argument or mark it as optional in the schema".into()),
                 severity: Severity::Error,
@@ -677,10 +689,13 @@ fn validate_node_entries(
                     #[cfg(not(feature = "span"))]
                     let span = SourceSpan::new(0.into(), 0);
 
+                    let about = extract_about(prop_def);
+                    let base_msg = format!("Missing required property: '{}'", name);
+
                     errors.push(KdlDiagnostic {
                         input: input.clone(),
                         span,
-                        message: Some(format!("Missing required property: '{}'", name)),
+                        message: Some(format_message_with_about(&base_msg, about.as_deref())),
                         label: Some("required property not found".into()),
                         help: None,
                         severity: Severity::Error,
@@ -796,10 +811,13 @@ fn check_node_cardinality(
                 #[cfg(not(feature = "span"))]
                 let span = SourceSpan::new(0.into(), 0);
 
+                let about = extract_about(def);
+                let base_msg = format!("Missing required node: '{}'", name);
+
                 errors.push(KdlDiagnostic {
                     input: input.clone(),
                     span,
-                    message: Some(format!("Missing required node: '{}'", name)),
+                    message: Some(format_message_with_about(&base_msg, about.as_deref())),
                     label: Some("required node not found".into()),
                     help: None,
                     severity: Severity::Error,
@@ -807,19 +825,23 @@ fn check_node_cardinality(
             }
 
             // Check repeatable constraints
+            let about = extract_about(def);
+
             if !is_repeatable && count > 1 {
                 #[cfg(feature = "span")]
                 let span = target.span();
                 #[cfg(not(feature = "span"))]
                 let span = SourceSpan::new(0.into(), 0);
 
+                let base_msg = format!(
+                    "Node '{}' is not repeatable but appears {} times",
+                    name, count
+                );
+
                 errors.push(KdlDiagnostic {
                     input: input.clone(),
                     span,
-                    message: Some(format!(
-                        "Node '{}' is not repeatable but appears {} times",
-                        name, count
-                    )),
+                    message: Some(format_message_with_about(&base_msg, about.as_deref())),
                     label: Some("duplicate node".into()),
                     help: Some("Mark the node as 'repeatable' or remove duplicates".into()),
                     severity: Severity::Error,
@@ -833,13 +855,15 @@ fn check_node_cardinality(
                     #[cfg(not(feature = "span"))]
                     let span = SourceSpan::new(0.into(), 0);
 
+                    let base_msg = format!(
+                        "Too few '{}' nodes: expected at least {}, found {}",
+                        name, min, count
+                    );
+
                     errors.push(KdlDiagnostic {
                         input: input.clone(),
                         span,
-                        message: Some(format!(
-                            "Too few '{}' nodes: expected at least {}, found {}",
-                            name, min, count
-                        )),
+                        message: Some(format_message_with_about(&base_msg, about.as_deref())),
                         label: Some("not enough nodes".into()),
                         help: None,
                         severity: Severity::Error,
@@ -854,13 +878,15 @@ fn check_node_cardinality(
                     #[cfg(not(feature = "span"))]
                     let span = SourceSpan::new(0.into(), 0);
 
+                    let base_msg = format!(
+                        "Too many '{}' nodes: expected at most {}, found {}",
+                        name, max, count
+                    );
+
                     errors.push(KdlDiagnostic {
                         input: input.clone(),
                         span,
-                        message: Some(format!(
-                            "Too many '{}' nodes: expected at most {}, found {}",
-                            name, max, count
-                        )),
+                        message: Some(format_message_with_about(&base_msg, about.as_deref())),
                         label: Some("too many nodes".into()),
                         help: None,
                         severity: Severity::Error,

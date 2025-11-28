@@ -29,7 +29,8 @@ impl Backend {
         self.document_map.insert(uri.to_string(), rope);
     }
 
-    /// Validate document against its associated schema.
+    /// Validate document against its associated schema(s).
+    /// Per spec: ALL schemas must validate for the document to pass.
     fn validate_with_schema(
         &self,
         doc: &KdlDocument,
@@ -39,32 +40,41 @@ impl Backend {
         let mut diagnostics = Vec::new();
 
         match &schema_source {
-            SchemaSource::Directive {
-                path,
-                directive_span,
-            } => {
-                match self.schema_manager.get_or_load_schema(path) {
-                    Ok(schema) => {
-                        let kdl_diags = schema.validate(doc);
-                        diagnostics.extend(self.convert_kdl_diagnostics(&kdl_diags, rope));
-                    }
-                    Err(err) => {
-                        // Show error at the @ksl:schema directive location
-                        diagnostics.push(Diagnostic::new(
-                            Range::new(
-                                char_to_position(directive_span.offset(), rope),
-                                char_to_position(
-                                    directive_span.offset() + directive_span.len(),
-                                    rope,
+            SchemaSource::Directives(directives) => {
+                // Validate against ALL schemas - ALL must pass
+                for directive in directives {
+                    match self.schema_manager.get_or_load_schema(&directive.path) {
+                        Ok(schema) => {
+                            let kdl_diags = schema.validate(doc);
+                            // Convert severity based on warn_only flag
+                            let converted =
+                                self.convert_kdl_diagnostics(&kdl_diags, rope, directive.warn_only);
+                            diagnostics.extend(converted);
+                        }
+                        Err(err) => {
+                            // Show error at the @ksl:schema directive location
+                            let severity = if directive.warn_only {
+                                DiagnosticSeverity::WARNING
+                            } else {
+                                DiagnosticSeverity::ERROR
+                            };
+                            diagnostics.push(Diagnostic::new(
+                                Range::new(
+                                    char_to_position(directive.directive_span.offset(), rope),
+                                    char_to_position(
+                                        directive.directive_span.offset()
+                                            + directive.directive_span.len(),
+                                        rope,
+                                    ),
                                 ),
-                            ),
-                            Some(DiagnosticSeverity::ERROR),
-                            Some(NumberOrString::String("schema-load-error".into())),
-                            Some("kdl-schema-v2".into()),
-                            format!("Failed to load schema: {}", err),
-                            None,
-                            None,
-                        ));
+                                Some(severity),
+                                Some(NumberOrString::String("schema-load-error".into())),
+                                Some("kdl-schema-v2".into()),
+                                format!("Failed to load schema: {}", err),
+                                None,
+                                None,
+                            ));
+                        }
                     }
                 }
             }
@@ -72,7 +82,7 @@ impl Backend {
                 match self.schema_manager.get_or_load_schema(path) {
                     Ok(schema) => {
                         let kdl_diags = schema.validate(doc);
-                        diagnostics.extend(self.convert_kdl_diagnostics(&kdl_diags, rope));
+                        diagnostics.extend(self.convert_kdl_diagnostics(&kdl_diags, rope, false));
                     }
                     Err(err) => {
                         // Config-based schema errors show at document start
@@ -96,16 +106,31 @@ impl Backend {
     }
 
     /// Convert KdlDiagnostic to LSP Diagnostic.
-    fn convert_kdl_diagnostics(&self, kdl_diags: &[KdlDiagnostic], rope: &Rope) -> Vec<Diagnostic> {
+    /// If `warn_only` is true, errors are downgraded to warnings.
+    fn convert_kdl_diagnostics(
+        &self,
+        kdl_diags: &[KdlDiagnostic],
+        rope: &Rope,
+        warn_only: bool,
+    ) -> Vec<Diagnostic> {
         kdl_diags
             .iter()
             .map(|diag| {
+                let severity = if warn_only {
+                    // Downgrade errors to warnings when warn_only is set
+                    match diag.severity {
+                        miette::Severity::Error => DiagnosticSeverity::WARNING,
+                        other => to_lsp_sev(other),
+                    }
+                } else {
+                    to_lsp_sev(diag.severity)
+                };
                 Diagnostic::new(
                     Range::new(
                         char_to_position(diag.span.offset(), rope),
                         char_to_position(diag.span.offset() + diag.span.len(), rope),
                     ),
-                    Some(to_lsp_sev(diag.severity)),
+                    Some(severity),
                     Some(NumberOrString::String("kdl-schema".into())),
                     Some("kdl-schema-v2".into()),
                     diag.message

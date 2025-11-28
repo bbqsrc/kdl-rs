@@ -147,6 +147,17 @@ impl KdlSchemaV2 {
         self.doc.get("metadata")
     }
 
+    /// Returns the schema's identifier from `metadata > id`, if present.
+    ///
+    /// This is typically a URL that serves as the base for resolving relative
+    /// schema references in `ref` nodes.
+    pub fn metadata_id(&self) -> Option<&str> {
+        let metadata = self.metadata()?;
+        let children = metadata.children()?;
+        let id_node = children.get("id")?;
+        id_node.get(0)?.as_string()
+    }
+
     /// Returns the `definitions` node from the schema, if present.
     pub(crate) fn definitions(&self) -> Option<&KdlNode> {
         self.doc.get("definitions")
@@ -1176,5 +1187,225 @@ document {
             !errors.is_empty(),
             "Expected error - arg is required and has no default"
         );
+    }
+
+    // Tests for spec compliance: about, format type checking, metadata_id
+
+    #[test]
+    fn test_about_property_in_error() {
+        let schema_src = r#"
+document {
+    node "person" about="A person node representing an individual" {
+        required
+    }
+}
+"#;
+        let doc_src = "other"; // missing required "person"
+        let schema = KdlSchemaV2::parse(schema_src).unwrap();
+        let doc: KdlDocument = doc_src.parse().unwrap();
+        let errors = schema.validate(&doc);
+        assert!(!errors.is_empty());
+        let msg = errors[0].message.as_ref().unwrap();
+        assert!(
+            msg.contains("A person node representing"),
+            "Error should include about text: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_about_child_node_takes_precedence() {
+        let schema_src = r#"
+document {
+    node "person" about="This is the PROPERTY description" {
+        required
+        about "This is the CHILD NODE description which takes precedence"
+    }
+}
+"#;
+        let doc_src = "other"; // missing required "person"
+        let schema = KdlSchemaV2::parse(schema_src).unwrap();
+        let doc: KdlDocument = doc_src.parse().unwrap();
+        let errors = schema.validate(&doc);
+        assert!(!errors.is_empty());
+        let msg = errors[0].message.as_ref().unwrap();
+        // Child node description should be used, not property
+        assert!(
+            msg.contains("CHILD NODE description"),
+            "Error should use child node about text: {}",
+            msg
+        );
+        assert!(
+            !msg.contains("PROPERTY description"),
+            "Error should NOT use property about text: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_about_in_arg_error() {
+        let schema_src = r#"
+document {
+    node "config" {
+        arg about="The configuration value to set" {
+            type string
+        }
+    }
+}
+"#;
+        let doc_src = "config"; // missing required arg
+        let schema = KdlSchemaV2::parse(schema_src).unwrap();
+        let doc: KdlDocument = doc_src.parse().unwrap();
+        let errors = schema.validate(&doc);
+        assert!(!errors.is_empty());
+        let msg = errors[0].message.as_ref().unwrap();
+        assert!(
+            msg.contains("configuration value"),
+            "Error should include about text from arg: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_about_in_prop_error() {
+        let schema_src = r#"
+document {
+    node "user" {
+        prop "name" about="The user's display name" {
+            required
+            type string
+        }
+    }
+}
+"#;
+        let doc_src = "user"; // missing required prop "name"
+        let schema = KdlSchemaV2::parse(schema_src).unwrap();
+        let doc: KdlDocument = doc_src.parse().unwrap();
+        let errors = schema.validate(&doc);
+        assert!(!errors.is_empty());
+        let msg = errors[0].message.as_ref().unwrap();
+        assert!(
+            msg.contains("display name"),
+            "Error should include about text from prop: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_format_skips_incompatible_type() {
+        // Per spec: format validation MUST be skipped if value type doesn't match
+        let schema_src = r#"
+document {
+    node "test" {
+        arg {
+            type number
+            format url  // url format is for strings, should be skipped for numbers
+        }
+    }
+}
+"#;
+        let doc_src = "test 42"; // number, not string - format should be skipped
+        let schema = KdlSchemaV2::parse(schema_src).unwrap();
+        let doc: KdlDocument = doc_src.parse().unwrap();
+        let errors = schema.validate(&doc);
+        // Should be valid - format is skipped because type doesn't match
+        assert!(
+            errors.is_empty(),
+            "Expected no errors - format should be skipped for incompatible type: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_format_applied_for_compatible_type() {
+        // Format should be applied when type matches
+        let schema_src = r#"
+document {
+    node "test" {
+        arg {
+            type string
+            format url
+        }
+    }
+}
+"#;
+        let doc_src = r#"test "not-a-url""#; // string but invalid URL
+        let schema = KdlSchemaV2::parse(schema_src).unwrap();
+        let doc: KdlDocument = doc_src.parse().unwrap();
+        let errors = schema.validate(&doc);
+        // Should error - format is applied because type matches
+        assert!(
+            !errors.is_empty(),
+            "Expected error - format should be applied for compatible type"
+        );
+    }
+
+    #[test]
+    fn test_integer_format_skips_string() {
+        // Integer formats (i8, u32, etc.) should be skipped for strings
+        let schema_src = r#"
+document {
+    node "test" {
+        arg {
+            type string
+            format i32  // i32 format is for integers, should be skipped for strings
+        }
+    }
+}
+"#;
+        let doc_src = r#"test "hello""#;
+        let schema = KdlSchemaV2::parse(schema_src).unwrap();
+        let doc: KdlDocument = doc_src.parse().unwrap();
+        let errors = schema.validate(&doc);
+        assert!(
+            errors.is_empty(),
+            "Expected no errors - integer format should be skipped for string: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_metadata_id() {
+        let schema_src = r#"
+metadata {
+    id "https://example.com/schemas/test.kdl"
+    title "Test Schema"
+}
+
+document {
+    node "test"
+}
+"#;
+        let schema = KdlSchemaV2::parse(schema_src).unwrap();
+        assert_eq!(
+            schema.metadata_id(),
+            Some("https://example.com/schemas/test.kdl")
+        );
+    }
+
+    #[test]
+    fn test_metadata_id_missing() {
+        let schema_src = r#"
+metadata {
+    title "Test Schema"
+}
+
+document {
+    node "test"
+}
+"#;
+        let schema = KdlSchemaV2::parse(schema_src).unwrap();
+        assert_eq!(schema.metadata_id(), None);
+    }
+
+    #[test]
+    fn test_metadata_id_no_metadata() {
+        let schema_src = r#"
+document {
+    node "test"
+}
+"#;
+        let schema = KdlSchemaV2::parse(schema_src).unwrap();
+        assert_eq!(schema.metadata_id(), None);
     }
 }
